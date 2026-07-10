@@ -71,7 +71,10 @@ where
             .fields
             .get("message")
             .is_some_and(|message| {
-                message.trim_matches('"') == "provider downlink: history response"
+                matches!(
+                    message.trim_matches('"'),
+                    "provider downlink: history response" | "provider downlink: webhook non-2xx"
+                )
             })
         {
             self.events
@@ -264,6 +267,50 @@ async fn provider_delivery_rejects_private_webhook_url_before_request() {
         .expect_err("private webhook URL should be rejected before request");
 
     assert!(err.to_string().contains("provider webhook_url is not allowed"));
+}
+
+#[tokio::test]
+async fn provider_delivery_logs_non_success_response_body() {
+    let logs = install_log_capture();
+    logs.lock().unwrap().clear();
+
+    let app = Router::new().route("/webhook", post(capture_unauthorized));
+    let (webhook_url, server) = spawn_server(app).await;
+
+    let transport = HttpProviderTransport::allowing_private_networks_for_tests();
+    let err = transport
+        .deliver(BotDeliveryCommand {
+            target: provider_target(webhook_url),
+            run_id: "run-401".to_string(),
+            frame: BcsFrame::Request(RequestFrame::new(
+                "run-401",
+                "chat.send",
+                Some(json!({
+                    "bcs_group_id": "group-401",
+                    "message": {
+                        "text": "hello"
+                    }
+                })),
+            )),
+            delivery_kind: BotDeliveryKind::Send,
+            provider_transport: Default::default(),
+        })
+        .await
+        .expect_err("provider 401 should fail delivery");
+
+    assert!(err.to_string().contains("401 Unauthorized"));
+    let events = logs.lock().unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.field("frame_id").as_deref() == Some("run-401"))
+        .expect("non-2xx log event");
+    assert_eq!(event.field("status").as_deref(), Some("401"));
+    assert_eq!(
+        event.field("response_body").as_deref(),
+        Some(r#"{"code":"401","message":"x-one-id is required","success":false}"#)
+    );
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -618,6 +665,17 @@ async fn capture_sse() -> Response {
         .header("content-type", "text/event-stream; charset=utf-8")
         .body(Body::from(body))
         .unwrap()
+}
+
+async fn capture_unauthorized() -> (axum::http::StatusCode, Json<Value>) {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "401",
+            "message": "x-one-id is required",
+            "success": false
+        })),
+    )
 }
 
 async fn capture(captured: CapturedState, headers: HeaderMap, body: Value) {

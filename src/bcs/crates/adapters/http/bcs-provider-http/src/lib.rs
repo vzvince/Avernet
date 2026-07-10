@@ -39,6 +39,7 @@ const SSE_CTX_RETRY_MAX: u32 = 20;
 /// it recovers below the threshold. Edge-triggered so a sustained backlog logs
 /// twice (enter + recover), not once per frame.
 const SSE_LAG_ALERT_MS: u64 = 5_000;
+const PROVIDER_RESPONSE_BODY_LOG_MAX_CHARS: usize = 4096;
 
 /// Edge-triggered tracker for a run's consumption lag, so a sustained backlog
 /// produces exactly one "falling behind" WARN and one "recovered" WARN rather
@@ -678,6 +679,16 @@ async fn send_provider_request(
 
     let status = response.status();
     if !status.is_success() {
+        let response_body_result = response.text().await;
+        let (response_body, response_body_truncated, response_body_read_error) =
+            match response_body_result {
+                Ok(body) => {
+                    let (body, truncated) =
+                        truncate_provider_response_body_for_log(&body);
+                    (Some(body), truncated, None)
+                }
+                Err(error) => (None, false, Some(error.to_string())),
+            };
         warn!(
             provider_id = %body.to_bot.provider_id,
             method = %body.method,
@@ -685,6 +696,9 @@ async fn send_provider_request(
             message_id = %message_id,
             webhook_url = %webhook_url,
             status = %status.as_u16(),
+            response_body = response_body.as_deref().unwrap_or_default(),
+            response_body_truncated = response_body_truncated,
+            response_body_read_error = response_body_read_error.as_deref().unwrap_or_default(),
             "provider downlink: webhook non-2xx"
         );
         return Err(ServiceError::InternalError(format!(
@@ -693,6 +707,19 @@ async fn send_provider_request(
     }
 
     Ok(response)
+}
+
+fn truncate_provider_response_body_for_log(body: &str) -> (String, bool) {
+    let mut chars = body.chars();
+    let preview: String = chars
+        .by_ref()
+        .take(PROVIDER_RESPONSE_BODY_LOG_MAX_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        (format!("{preview}... (truncated)"), true)
+    } else {
+        (preview, false)
+    }
 }
 
 fn provider_client_builder() -> reqwest::ClientBuilder {
