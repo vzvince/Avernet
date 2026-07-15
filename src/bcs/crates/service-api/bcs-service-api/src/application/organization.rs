@@ -64,6 +64,13 @@ pub trait OrganizationManagementService: Send + Sync {
         organization_code: &str,
         bot_uuid: &str,
     ) -> ServiceResult<Option<OrganizationMember>>;
+    /// Authorize an organization owner to invoke an active, effective member.
+    async fn require_invocable_member(
+        &self,
+        auth: OrganizationAuth,
+        organization_code: &str,
+        bot_uuid: &str,
+    ) -> ServiceResult<OrganizationMember>;
     async fn list_members(
         &self,
         auth: OrganizationAuth,
