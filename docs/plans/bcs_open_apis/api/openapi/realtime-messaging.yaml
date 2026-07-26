@@ -1,0 +1,125 @@
+openapi: 3.1.0
+info:
+  title: BCN API - 消息会话
+  version: "2026-07-06"
+  description: >
+    BCN 消息会话分组（目标态）。本文件描述 Workbench 前端 WebSocket 入口与帧协议。
+    Bot Runtime WebSocket 属于内部协议，不进入外部 OpenAPI；详见 `bcs-interface-catalog.md`。
+
+    REST 响应统一使用 `Envelope`；WebSocket 帧不使用 REST envelope，但错误载荷建议复用
+    `code` 与 `message`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: realtime-messaging
+    description: Workbench 前端实时通信通道。
+
+paths:
+  /openapi/bcn/v1/ws:
+    get:
+      operationId: connectWorkbenchWebSocket
+      tags: [realtime-messaging]
+      summary: 建立 Workbench WebSocket
+      description: >
+        作用：建立前端 Workbench 到 BCN 的 WebSocket 连接，用于群组或 Session 内实时消息收发。
+
+        鉴权：支持 human cookie、agent bearer token 或 AgentPass token；HTTP upgrade 阶段当前不强制 cookie/token；
+        连接建立后通过 `connect` 帧绑定 group/session/actor 上下文，后续 `chat.send` 和 `chat.abort`
+        基于该上下文做业务校验。
+      security:
+        - humanCookie: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+        - {}
+      responses:
+        "101":
+          description: WebSocket upgrade accepted.
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+
+  schemas:
+    WorkbenchFrame:
+      oneOf:
+        - $ref: "#/components/schemas/WorkbenchConnectRequest"
+        - $ref: "#/components/schemas/WorkbenchChatSendRequest"
+        - $ref: "#/components/schemas/WorkbenchChatAbortRequest"
+
+    WorkbenchConnectRequest:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [connect] }
+        params:
+          type: object
+          properties:
+            group_id: { type: string, nullable: true }
+            session_id: { type: string, nullable: true }
+            actor_id: { type: string, nullable: true }
+
+    WorkbenchChatSendRequest:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [chat.send] }
+        params:
+          type: object
+          required: [content]
+          properties:
+            content: { type: string }
+            mentions:
+              type: array
+              items: { type: string }
+            metadata: { type: object, additionalProperties: true }
+
+    WorkbenchChatAbortRequest:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [chat.abort] }
+        params:
+          type: object
+          required: [run_id]
+          properties:
+            run_id: { type: string }
+
+    WorkbenchResponseFrame:
+      type: object
+      required: [type, id, ok]
+      properties:
+        type: { type: string, enum: [res] }
+        id: { type: string }
+        ok: { type: boolean }
+        payload: { nullable: true }
+        error:
+          type: object
+          nullable: true
+          properties:
+            code: { type: integer }
+            message: { type: string }
+
+    WorkbenchEventFrame:
+      type: object
+      required: [type, event, payload]
+      properties:
+        type: { type: string, enum: [event] }
+        event: { type: string }
+        payload: { type: object, additionalProperties: true }

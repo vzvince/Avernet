@@ -1,0 +1,208 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Invitations
+  version: "2026-07-20"
+  description: Group 和 Session 的 Human 邀请链接及幂等加入接口。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: invitations
+    description: Group 和 Session 邀请。
+
+paths:
+  /openapi/v1/bcn/groups/{group_id}/invite-link:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    post:
+      operationId: createGroupInviteLink
+      tags: [invitations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40008, message: invitation configuration is invalid, condition: 邀请有效期、目标范围或其他配置不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份无权为 Group 创建邀请。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40908, message: group state does not allow the operation, condition: Group 当前状态不允许创建邀请。 }
+      summary: 创建 Group 邀请链接
+      description: >
+        仅 GroupManager 可以创建。Group 必须处于 active 且不能是 dm。Body 可以完全省略；
+        提供 ttl_seconds 时服务端限制最大有效期。邀请只允许 Human 加入长期 GroupParticipant。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: false
+        description: 可选有效期；省略 Body 或 ttl_seconds 时使用服务端默认值。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInviteLinkRequest" }
+      responses:
+        "201":
+          description: 新签发的 Group Invitation，target_type 固定为 group。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvitationResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/groups/join/{token}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/InviteTokenPath"
+    post:
+      operationId: joinGroupByInvite
+      tags: [invitations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40407, message: invitation was not found, condition: 邀请不存在、签名无效或对调用方不可见。 }
+        "409":
+          - { code: 40909, message: invitation state does not allow the operation, condition: 邀请已被使用、撤销，或 Actor 已经加入目标 Group。 }
+        "410":
+          - { code: 41001, message: invitation has expired, condition: 邀请已经超过有效期。 }
+      summary: Human 通过邀请加入 Group
+      description: >
+        仅 HumanCookie。服务端从 Cookie 建立或获取 HumanActor，并以 role=consultant 加入 GroupParticipant，
+        不写 Session mode，也不加入已有 Session。首次加入返回 joined=true；已经是 Participant 时返回
+        joined=false、already_member=true，HTTP 都为 200。无效 token 返回 401，过期返回 410。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: >
+            新增 Participant 时 joined=true/already_member=false；幂等重试或已经是成员时
+            joined=false/already_member=true。两种情况使用相同 JoinResult 结构。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinResultResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+
+  /openapi/v1/bcn/sessions/{session_id}/invite-link:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+    post:
+      operationId: createSessionInviteLink
+      tags: [invitations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40008, message: invitation configuration is invalid, condition: 邀请有效期、目标范围或其他配置不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份无权为 Session 创建邀请。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Session 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40904, message: session state does not allow the operation, condition: Session 当前状态不允许创建邀请。 }
+      summary: 创建 Session 邀请链接
+      description: >
+        GroupManager 或 Session 创建者可以为仍在 running 的 Chat Session 创建邀请。
+        Body 可以省略；邀请只将 Human 加入 SessionParticipant，不提升为 GroupParticipant。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: false
+        description: 可选有效期；省略时使用服务端默认值。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInviteLinkRequest" }
+      responses:
+        "201":
+          description: 新签发的 Session Invitation，target_type 固定为 session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvitationResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/sessions/join/{token}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/InviteTokenPath"
+    post:
+      operationId: joinSessionByInvite
+      tags: [invitations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40407, message: invitation was not found, condition: 邀请不存在、签名无效或对调用方不可见。 }
+        "409":
+          - { code: 40909, message: invitation state does not allow the operation, condition: 邀请已被使用、撤销，或 Actor 已经加入目标 Session。 }
+        "410":
+          - { code: 41001, message: invitation has expired, condition: 邀请已经超过有效期。 }
+      summary: Human 通过邀请加入 Session
+      description: >
+        仅 HumanCookie。首次加入时创建 HumanSessionParticipant，role=observer、mode=present；
+        不创建 GroupParticipant。已经参与时幂等返回 already_member=true。无效 token 返回 401，
+        过期返回 410，Session 已完成或不可加入返回 409。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: >
+            新加入时 joined=true；已参与时 joined=false、already_member=true。
+            target_type 固定为 session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinResultResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    botRuntimeBearer: { $ref: "../_shared.yaml#/components/securitySchemes/botRuntimeBearer" }
+    agentPassBearer: { $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearer" }
+  schemas:
+    CreateInviteLinkRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          description: 邀请有效期秒数，60 秒到 7 天；省略时使用服务端默认值。
+    InvitationResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Invitation" }
+    JoinResultResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/JoinResult" }

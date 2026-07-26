@@ -1,0 +1,156 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Personal Bot Registration
+  version: "2026-07-20"
+  description: Human 获取注册令牌并将个人 Plugin Bot 注册到 BCN 默认 Provider。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: bot-registration
+    description: 个人 Bot 的两阶段标准注册流程。
+
+paths:
+  /openapi/v1/bcn/bot-registration-tokens:
+    post:
+      operationId: createBotRegistrationToken
+      tags: [bot-registration]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带有效 HumanCookie。 }
+          - { code: 40101, message: credential is invalid or expired, condition: HumanCookie 无效或已经过期。 }
+        "429":
+          - { code: 42901, message: rate limit exceeded, condition: 当前 Human 签发注册令牌的频率超过限制。 }
+      summary: 签发个人 Bot 注册令牌
+      description: >
+        为当前 Human 签发短期 Registration Token。无需请求体；服务端从 HumanCookie 取得 staff_no，
+        令牌绑定该 Human、BCN 默认 Provider、conn_type=plugin、注册用途和过期时间。
+        第一版保持当前兼容语义：同一 token 在有效期内可注册多个 Bot；每次注册仍创建独立 BotActor。
+      security:
+        - humanCookie: []
+      responses:
+        "201":
+          description: 新签发的 Registration Token 和绝对过期时间；令牌不得进入 URL 或日志。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RegistrationTokenResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "429": { $ref: "../_shared.yaml#/components/responses/TooManyRequests" }
+
+  /openapi/v1/bcn/bot-registrations:
+    post:
+      operationId: registerPersonalBot
+      tags: [bot-registration]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40002, message: request body is invalid, condition: Bot 注册信息缺失或字段格式不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Bot Registration Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Bot Registration Token 无效。 }
+        "409":
+          - { code: 40907, message: bot identity already exists, condition: agent_code 或其他唯一 Bot 身份已经被注册。 }
+        "410":
+          - { code: 41002, message: registration token has expired, condition: Bot Registration Token 已过期或已被使用。 }
+        "429":
+          - { code: 42902, message: resource quota exceeded, condition: 当前 Human 创建 Bot 的数量超过配额。 }
+      summary: 注册个人 Plugin Bot
+      description: >
+        使用 Registration Token 创建 BotActor、creates 关系和 BCN 默认 Provider 的 plugin Binding。
+        name 必填；agent_code 和 descriptor 可选。created_by 从 token 中取得，provider_id 固定为
+        BCN 默认 Provider，provider_bot_ref 由服务端使用新 actor_id 生成。成功时只返回一次
+        bot_runtime_token；Registration Token 必须放在 Authorization Bearer Header，不能放入 query。
+      security:
+        - registrationBearer: []
+      requestBody:
+        required: true
+        description: 个人 Bot 名称、可选外部身份和能力描述。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterPersonalBotRequest" }
+      responses:
+        "201":
+          description: 新建 BotActor、默认 ProviderBinding 和只返回一次的 Bot Runtime Token。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PersonalBotRegistrationResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+        "429": { $ref: "../_shared.yaml#/components/responses/TooManyRequests" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    registrationBearer: { $ref: "../_shared.yaml#/components/securitySchemes/registrationBearer" }
+  schemas:
+    RegistrationTokenData:
+      type: object
+      required: [registration_token, expires_at]
+      properties:
+        registration_token: { type: string, description: 短期 Bot Registration Token，只能通过 Bearer Header 使用。 }
+        expires_at: { type: integer, format: int64, description: 令牌过期时间，Unix milliseconds。 }
+    RegistrationTokenResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/RegistrationTokenData" }
+    PersonalBotDescriptorInput:
+      type: object
+      additionalProperties: false
+      properties:
+        summary: { type: string, default: "", description: Bot 简要用途；省略为空字符串。 }
+        domains:
+          type: array
+          default: []
+          description: Bot 领域；省略为空数组。
+          items: { type: string }
+        skills:
+          type: array
+          default: []
+          description: Bot 技能；省略为空数组。
+          items: { $ref: "../domain-models.yaml#/components/schemas/Skill" }
+        scopes:
+          type: array
+          default: []
+          description: Bot scope；省略为空数组。
+          items: { type: string }
+    RegisterPersonalBotRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 2, maxLength: 64, description: BotActor 展示名称。 }
+        agent_code: { type: string, description: 可选外部 Agent 身份；存在时在环境内唯一。 }
+        visibility: { allOf: [{ $ref: "../domain-models.yaml#/components/schemas/ActorVisibility" }], default: protected, description: 初始可见性；省略为 protected。 }
+        descriptor: { $ref: "#/components/schemas/PersonalBotDescriptorInput" }
+    PersonalBotRegistrationData:
+      type: object
+      required: [actor, binding, credentials]
+      properties:
+        actor: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+        binding:
+          description: 自动创建的 BCN 默认 Provider plugin Binding。
+          allOf:
+            - $ref: "../domain-models.yaml#/components/schemas/ProviderBotBinding"
+            - type: object
+              required: [conn_type]
+              properties:
+                conn_type: { type: string, const: plugin, description: 个人注册固定为 plugin。 }
+        credentials:
+          type: object
+          required: [bot_runtime_token]
+          description: 个人 Plugin Bot 的首次直连凭证，只返回一次。
+          properties:
+            bot_runtime_token: { type: string, description: 新 Bot 的直连 Runtime Token，只返回一次。 }
+    PersonalBotRegistrationResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/PersonalBotRegistrationData" }

@@ -1,0 +1,740 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Groups
+  version: "2026-07-20"
+  description: Actor 的 Group 查询、Group 管理、GroupParticipant、Group Session 和协作模板。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: groups
+    description: Group 查询和管理。
+  - name: group-participants
+    description: Group 的长期参与者关系和群级角色。
+  - name: sessions
+    description: Session 创建、查询、参与者和生命周期。
+  - name: collaboration-templates
+    description: 创建显式协作 Group 使用的模板。
+
+paths:
+  /openapi/v1/bcn/actors/{actor_id}/groups:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    get:
+      operationId: listActorGroups
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40003, message: pagination parameters are invalid, condition: offset、limit 或查询过滤参数不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40401, message: actor was not found, condition: Actor 不存在，或调用方无权查询其 Group。 }
+      summary: 查询 Actor 直接参与的 Group
+      description: >
+        只返回存在 GroupParticipant(actor_id) 的 Group，不包含 Actor 仅作为 SessionParticipant
+        临时参与的 Group。HumanCookie 只能查询本人 HumanActor 或本人创建的 BotActor；
+        Bot/AgentPass 必须与 actor_id 完全一致。无权查询与 Actor 不存在统一返回 404。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - $ref: "#/components/parameters/GroupKindFilter"
+        - $ref: "#/components/parameters/GroupStatusFilter"
+        - $ref: "#/components/parameters/GroupVisibilityFilter"
+        - $ref: "#/components/parameters/GroupStrategyFilter"
+        - $ref: "#/components/parameters/GroupTextFilter"
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Actor 作为 GroupParticipant 直接参与的分页 GroupSummary。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorGroupPageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/actors/{actor_id}/groups/session-only:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    get:
+      operationId: listActorSessionOnlyGroups
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40003, message: pagination parameters are invalid, condition: offset、limit 或查询过滤参数不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40401, message: actor was not found, condition: Actor 不存在，或调用方无权查询其 Session-only Group。 }
+      summary: 查询 Actor 仅通过 Session 参与的 Group
+      description: >
+        返回不存在 GroupParticipant(actor_id)，但至少存在一个 SessionParticipant(actor_id) 的 Group，
+        并按 group_id 去重。该结果不授予群级成员或管理权限；Actor 只能访问自己实际参与的 Session。
+        鉴权规则与直接参与 Group 查询相同。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - $ref: "#/components/parameters/GroupKindFilter"
+        - $ref: "#/components/parameters/GroupStatusFilter"
+        - $ref: "#/components/parameters/GroupVisibilityFilter"
+        - $ref: "#/components/parameters/GroupStrategyFilter"
+        - $ref: "#/components/parameters/GroupTextFilter"
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Actor 仅通过 SessionParticipant 参与的分页 GroupSummary。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorGroupPageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/groups:
+    post:
+      operationId: createGroup
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40015, message: group configuration is invalid, condition: driver、participants、strategy 或其他 Group 配置不满足约束。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40301, message: caller is not allowed to act as the specified actor, condition: 调用身份无权代表 originator 或 driver 创建 Group。 }
+        "409":
+          - { code: 40901, message: group already exists, condition: group_id 或 DM 唯一成员组合已经存在。 }
+      summary: 创建 Group
+      description: >
+        创建长期协作空间。label、driver 和 participants 必填；不允许输入 status、version、created_by
+        和时间字段。driver 必须是 participants 中 role=driver 的 BotActor，Participant 不包含 mode。
+        Human 创建时 created_by 来自 Cookie staff_no；Bot 创建时 originator 必须是 token Bot，created_by
+        从该 Bot 的创建者派生。服务端同时校验 Actor 存在性、可见性、可达性和 strategy 角色约束。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: Group 初始配置和长期 Participant。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateGroupRequest" }
+      responses:
+        "201":
+          description: 创建后的完整 Group，服务端补齐 ID、版本、状态、created_by 和时间字段。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/groups/{group_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    get:
+      operationId: getGroup
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份不是 Group 成员且不具备读取权限。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 不存在，或调用方无权知道其是否存在。 }
+      summary: 获取 Group 详情
+      description: >
+        返回完整 Group 和长期 Participant。GroupManager、直接 GroupParticipant，以及可代表直接
+        BotParticipant 的 Human creator 可以读取；其他已认证 Actor 只能读取 public Group。
+        仅作为 SessionParticipant 不自动获得完整 Group 详情权限。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: 完整 Group；可选配置不存在时对应字段省略，敏感 callback 配置必须脱敏。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateGroup
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40002, message: request body is invalid, condition: 更新体为空、字段不合法或没有可更新字段。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份不是 originator、driver 或获授权的管理者。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40908, message: group state does not allow the operation, condition: Group 当前生命周期状态不允许修改。 }
+      summary: 更新 Group 可变属性
+      description: >
+        仅 GroupManager 可以修改 label、context、visibility，且至少提供一个字段。
+        kind、strategy、originator、driver、status、version、participants 和 created_by 不可通过本接口修改。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: Group 可变属性的部分更新。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateGroupRequest" }
+      responses:
+        "200":
+          description: 更新后的完整 Group。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    delete:
+      operationId: deleteGroup
+      tags: [groups]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份不是 originator、driver 或获授权的管理者。 }
+      summary: 删除 Group
+      description: >
+        仅 GroupManager 可以删除整个 Group 及其从属 Session 和关系。Participant 自己退出 Group
+        使用删除 Participant 接口。已经删除的 Group 按幂等语义返回 deleted=true。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: Group 已删除或此前已经删除。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteGroupResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/groups/{group_id}/participants:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    post:
+      operationId: addGroupParticipant
+      tags: [group-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: Actor、角色或 Group 成员约束不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份无权管理 Group 成员。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 或目标 Actor 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40902, message: participant already exists, condition: Actor 已经是 GroupParticipant。 }
+      summary: 添加 GroupParticipant
+      description: >
+        仅 GroupManager 可以添加长期 Participant。actor_id、actor_kind、role 均必填，不允许 mode。
+        服务端校验 Actor 存在、kind 一致、关系不重复、role 与 strategy 兼容，以及 Actor 的可达性和可见性。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 要加入 Group 的 Actor 及群级角色。
+        content:
+          application/json:
+            schema: { $ref: "../domain-models.yaml#/components/schemas/GroupParticipant" }
+      responses:
+        "201":
+          description: 新增的 GroupParticipant。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/groups/{group_id}/participants/{actor_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    patch:
+      operationId: updateGroupParticipantRole
+      tags: [group-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: 新角色不合法或违反 Group 角色约束。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份无权修改 GroupParticipant 角色。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 或 GroupParticipant 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40908, message: group state does not allow the operation, condition: Group 状态或角色不变量不允许本次修改。 }
+      summary: 修改 GroupParticipant 角色
+      description: >
+        仅 GroupManager 可以修改群级 role。只允许 consultant、observer、manager、worker；driver
+        绑定 Group.driver，不能通过本接口设置。不能修改 Actor ID、ActorKind 或 Session mode。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 新的非 driver 群级角色。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateGroupParticipantRequest" }
+      responses:
+        "200":
+          description: 更新后的 GroupParticipant。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    delete:
+      operationId: deleteGroupParticipant
+      tags: [group-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: actor_id 不是合法 GroupParticipant 标识。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份无权删除 GroupParticipant。 }
+        "409":
+          - { code: 40903, message: participant cannot be removed, condition: 目标是不可删除的 driver，或删除会破坏 Group 成员约束。 }
+      summary: 删除或退出 GroupParticipant
+      description: >
+        GroupManager 可以移除普通 Participant；Actor 自身或 Bot 的 Human creator 可以代表该 Participant
+        退出。driver、originator 或 strategy 必要角色不能直接删除。关系不存在时按幂等删除返回 deleted=true。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: Participant 已删除或此前已经不存在。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteGroupParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/groups/{group_id}/sessions:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    post:
+      operationId: createGroupSession
+      tags: [sessions]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40014, message: session configuration is invalid, condition: Session kind、参与者或初始配置不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份无权在该 Group 中创建 Session。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40908, message: group state does not allow the operation, condition: Group 当前状态不允许创建新 Session。 }
+      summary: 在 Group 中创建 Session
+      description: >
+        从当前 GroupParticipant 创建独立 SessionParticipant 快照，不接受已有 session_id，也不提供 Reactivate。
+        session_kind=chat 时忽略 Invocation 字段并返回 ChatSession；session_kind=service_invocation 时返回
+        ServiceInvocationSession。省略 session_kind 时，state_machine Group 默认 service_invocation，其他 Group
+        默认 chat。private Group 限定成员或成员 Bot 的 creator；public Group 允许任意已认证 Actor 创建，
+        但非成员 caller_role 不能为 driver。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: false
+        description: 可选 Session 属性；完全省略时按 Group strategy 创建默认 Session。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateGroupSessionRequest" }
+      responses:
+        "201":
+          description: >
+            chat 输入或普通 Group 默认输入返回 ChatSession；service_invocation 输入或 state_machine Group
+            默认输入返回带 invocation 的 ServiceInvocationSession。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    get:
+      operationId: listGroupSessions
+      tags: [sessions]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40304, message: caller is not allowed to manage the specified group, condition: 调用身份没有查看 Group Session 的权限。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 不存在，或调用方无权知道其是否存在。 }
+      summary: 查询 Group 下可见 Session
+      description: >
+        不接受任意 participant_id。GroupManager、直接 GroupParticipant 和可代表直接 BotParticipant 的
+        Human creator 可查看 Group 全部 Session；session-only Actor 和 public Group 的其他 Actor 只能查看
+        自己实际参与的 Session。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按 Session 当前状态过滤。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/SessionStatus" }
+        - name: session_kind
+          in: query
+          required: false
+          description: 按 chat 或 service_invocation 过滤；省略返回两类。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/SessionKind" }
+        - name: q
+          in: query
+          required: false
+          description: 按 session_title 模糊过滤。
+          schema: { type: string }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 调用方可见的分页 SessionSummary。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupSessionPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/collaboration/templates:
+    get:
+      operationId: listCollaborationTemplates
+      tags: [collaboration-templates]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40003, message: pagination parameters are invalid, condition: offset、limit 或模板过滤参数不合法。 }
+      summary: 查询 Collaboration Template
+      description: >
+        查询可用于创建 state_machine 或其他显式协作 Group 的预置模板。当前模板为公开预置配置，
+        允许匿名读取；如果未来增加私有模板，需要改为认证后按调用方范围过滤。
+      security: []
+      parameters:
+        - name: language
+          in: query
+          required: false
+          description: 只返回指定语言的模板，例如 zh-CN；省略返回默认和所有可用语言。
+          schema: { type: string }
+        - name: tag
+          in: query
+          required: false
+          description: 只返回包含该标签的模板；省略表示不按标签过滤。
+          schema: { type: string }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 CollaborationTemplate，包含可用于初始化建群的 definition。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollaborationTemplatePageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+
+  /openapi/v1/bcn/collaboration/templates/{template_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/TemplateIdPath"
+    get:
+      operationId: getCollaborationTemplate
+      tags: [collaboration-templates]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "404":
+          - { code: 40408, message: collaboration template was not found, condition: CollaborationTemplate 不存在或不可用。 }
+      summary: 获取 Collaboration Template 详情
+      description: 获取单个模板及其 definition，用于初始化创建 Group 的 collaboration 配置。
+      security: []
+      parameters:
+        - name: language
+          in: query
+          required: false
+          description: 请求指定语言版本；省略时使用服务端默认语言。
+          schema: { type: string }
+      responses:
+        "200":
+          description: 指定语言或默认语言的 CollaborationTemplate。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollaborationTemplateResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    botRuntimeBearer: { $ref: "../_shared.yaml#/components/securitySchemes/botRuntimeBearer" }
+    agentPassBearer: { $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearer" }
+  parameters:
+    GroupKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: normal、dm 或 all；省略时为 normal。
+      schema: { type: string, enum: [normal, dm, all], default: normal }
+    GroupStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 按 Group 状态过滤；省略返回调用方可见的所有状态。
+      schema: { $ref: "../domain-models.yaml#/components/schemas/GroupStatus" }
+    GroupVisibilityFilter:
+      name: visibility
+      in: query
+      required: false
+      description: 按 private 或 public 过滤。
+      schema: { $ref: "../domain-models.yaml#/components/schemas/GroupVisibility" }
+    GroupStrategyFilter:
+      name: strategy
+      in: query
+      required: false
+      description: 按 Group 协作策略过滤。
+      schema: { $ref: "../domain-models.yaml#/components/schemas/GroupStrategy" }
+    GroupTextFilter:
+      name: q
+      in: query
+      required: false
+      description: 按 Group label 模糊过滤。
+      schema: { type: string }
+  schemas:
+    ActorGroupPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [actor_id, items]
+          properties:
+            actor_id: { type: string, description: 被查询的 Actor ID。 }
+            items:
+              type: array
+              items: { $ref: "../domain-models.yaml#/components/schemas/GroupSummary" }
+              description: 满足关系和过滤条件的 GroupSummary。
+    ActorGroupPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ActorGroupPageData" }
+    CreateGroupRequest:
+      type: object
+      required: [label, driver, participants]
+      additionalProperties: false
+      properties:
+        label: { type: string, minLength: 1, description: 群展示名称。 }
+        context: { type: string, default: "", description: 协作目标、背景和上下文；省略时为空字符串。 }
+        kind: { allOf: [{ $ref: "../domain-models.yaml#/components/schemas/GroupKind" }], default: normal, description: Group 类型；省略为 normal。 }
+        visibility: { allOf: [{ $ref: "../domain-models.yaml#/components/schemas/GroupVisibility" }], default: private, description: Group 可见范围；省略为 private。 }
+        originator: { type: string, description: 发起和协调 Actor；省略时为当前调用 Actor。 }
+        driver: { type: string, description: 主执行 BotActor ID，必须对应 role=driver 的 BotParticipant。 }
+        participants:
+          type: array
+          minItems: 1
+          description: 初始 GroupParticipant；必须包含 driver，不允许 mode。
+          items: { $ref: "../domain-models.yaml#/components/schemas/GroupParticipant" }
+        strategy: { allOf: [{ $ref: "../domain-models.yaml#/components/schemas/GroupStrategy" }], default: chat, description: 协作策略；省略为 chat。 }
+        routing_policy: { $ref: "../domain-models.yaml#/components/schemas/RoutingPolicy" }
+        collaboration: { $ref: "../domain-models.yaml#/components/schemas/CollaborationBinding" }
+        service_spec: { $ref: "../domain-models.yaml#/components/schemas/ServiceSpec" }
+    UpdateGroupRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        label: { type: string, minLength: 1, description: 新群名称；省略表示不修改。 }
+        context: { type: string, description: 新协作上下文；空字符串表示清空，省略表示不修改。 }
+        visibility: { $ref: "../domain-models.yaml#/components/schemas/GroupVisibility" }
+    GroupResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Group" }
+    DeleteGroupData:
+      type: object
+      required: [group_id, deleted]
+      properties:
+        group_id: { type: string, description: 被删除的 Group ID。 }
+        deleted: { type: boolean, const: true, description: 删除和幂等重试都固定为 true。 }
+    DeleteGroupResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/DeleteGroupData" }
+    UpdateGroupParticipantRequest:
+      type: object
+      required: [role]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [consultant, observer, manager, worker]
+          description: 新群级角色；driver 不允许通过本接口设置。
+    GroupParticipantResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/GroupParticipant" }
+    DeleteGroupParticipantData:
+      type: object
+      required: [group_id, actor_id, deleted]
+      properties:
+        group_id: { type: string, description: Group ID。 }
+        actor_id: { type: string, description: 被删除关系的 Actor ID。 }
+        deleted: { type: boolean, const: true, description: 删除和幂等重试都固定为 true。 }
+    DeleteGroupParticipantResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/DeleteGroupParticipantData" }
+    CreateChatSessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        session_kind: { type: string, const: chat, description: 显式指定 Chat Session；省略时由 Group strategy 决定。 }
+        session_title: { type: string, description: Session 标题；省略时为空字符串或服务端生成标题。 }
+        created_by: { type: string, description: Creator Actor；省略为当前调用 Actor，只允许调用方可代表的 Actor。 }
+        caller_role: { type: string, enum: [consultant, observer, manager, worker], description: public Group 非成员加入本 Session 的角色。 }
+    CreateInvocationSessionRequest:
+      type: object
+      required: [session_kind]
+      additionalProperties: false
+      properties:
+        session_kind: { type: string, const: service_invocation, description: 固定为 service_invocation。 }
+        session_title: { type: string, description: Session 标题；省略时为空字符串或服务端生成标题。 }
+        input: { description: 结构化调用输入；省略时使用空对象。 }
+        meta: { type: object, additionalProperties: true, description: 调用级扩展；省略时不写 metadata。 }
+        created_by: { type: string, description: Creator Actor；省略为当前调用 Actor。 }
+        caller_role: { type: string, enum: [consultant, observer, manager, worker], description: public Group 非成员的 Session 角色。 }
+    CreateGroupSessionRequest:
+      oneOf:
+        - $ref: "#/components/schemas/CreateChatSessionRequest"
+        - $ref: "#/components/schemas/CreateInvocationSessionRequest"
+      description: >
+        session_kind=service_invocation 选择调用输入；session_kind=chat 选择 Chat 输入；
+        session_kind 省略时只匹配 Chat DTO，但服务端仍按 Group strategy 决定默认 kind。
+    SessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Session" }
+    GroupSessionPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [group_id, items]
+          properties:
+            group_id: { type: string, description: 被查询的 Group ID。 }
+            items:
+              type: array
+              items: { $ref: "../domain-models.yaml#/components/schemas/SessionSummary" }
+              description: 调用方可见的 SessionSummary。
+    GroupSessionPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/GroupSessionPageData" }
+    CollaborationTemplatePageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              description: 当前页 CollaborationTemplate。
+              items: { $ref: "../domain-models.yaml#/components/schemas/CollaborationTemplate" }
+    CollaborationTemplatePageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CollaborationTemplatePageData" }
+    CollaborationTemplateResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/CollaborationTemplate" }

@@ -1,0 +1,511 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Actors and Bots
+  version: "2026-07-20"
+  description: Actor 目录、Actor 公共属性、Human 关联 Bot、Bot 能力发现和 BotDescriptor 管理。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: actors
+    description: HumanActor 和 BotActor 的统一目录及公共属性。
+  - name: bots
+    description: BotActor 专属的发现和能力描述。
+
+paths:
+  /openapi/v1/bcn/actors:
+    get:
+      operationId: listActors
+      tags: [actors]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40004, message: actor kind is invalid, condition: kind 不是 bot、human 或 all。 }
+          - { code: 40003, message: pagination parameters are invalid, condition: offset 或 limit 超出允许范围。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40301, message: caller is not allowed to act as the specified actor, condition: 调用身份无权代表 acting_actor_id。 }
+      summary: 查询 Actor 目录
+      description: >
+        按名称和基础属性确定性查询 Actor，不承担语义推荐。默认只查询可协作 BotActor；
+        查询 HumanActor 必须显式指定 kind=human 或 all。调用方必须有权代表 acting_actor_id，
+        服务端再按 visibility、Friendship 和共同 Group/Session 过滤结果。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: 按 Actor 名称等基础信息过滤；省略表示不按文本过滤。
+          schema: { type: string }
+        - name: kind
+          in: query
+          required: false
+          description: Actor 类型过滤；省略时只返回 bot。
+          schema: { type: string, enum: [bot, human, all], default: bot }
+        - name: acting_actor_id
+          in: query
+          required: false
+          description: >
+            本次查询代表的 Actor。Bot 凭证只能填写自身；HumanCookie 可填写本人 HumanActor
+            或本人创建的 BotActor。省略时 Bot 使用自身，Human 使用本人 HumanActor。
+          schema: { type: string }
+        - name: cooperatable_only
+          in: query
+          required: false
+          description: true 时只返回 collaboration_status=enabled 且当前可达并满足协作权限的 Actor。
+          schema: { type: boolean, default: true }
+        - name: provider_id
+          in: query
+          required: false
+          description: 只返回绑定到指定 Provider 的 BotActor；对 HumanActor 不生效。
+          schema: { type: string }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 Actor 列表；items 可同时包含 HumanActor 和 BotActor。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorPageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/actors/query:
+    post:
+      operationId: queryActors
+      tags: [actors]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40005, message: actor identifiers are invalid, condition: actor_ids 为空、超过 100 项或包含非法 Actor ID。 }
+          - { code: 40002, message: request body is invalid, condition: 请求体不是合法 JSON 或字段结构不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40301, message: caller is not allowed to act as the specified actor, condition: 调用身份无权代表 acting_actor_id。 }
+      summary: 按 ID 批量查询 Actor
+      description: >
+        按输入顺序批量返回调用方可见的 Actor。服务端对 actor_ids 去重；不存在和无权查看的 Actor
+        都会被静默排除，以避免身份枚举。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 要查询的 Actor ID 和可选的代表身份。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueryActorsRequest" }
+      responses:
+        "200":
+          description: 按 actor_ids 首次出现顺序排列的可见 Actor。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorListResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/actors/{actor_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    get:
+      operationId: getActor
+      tags: [actors]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40401, message: actor was not found, condition: Actor 不存在，或调用方无权知道该 Actor 是否存在。 }
+      summary: 获取 Actor 详情
+      description: >
+        返回 HumanActor 或 BotActor 完整结构。Actor 可读取自身；Human 可读取本人和本人创建的 Bot；
+        Provider Admin 可读取绑定到本 Provider 的 Bot；其他身份按可见性和协作关系判断。
+        目标不存在或无权查看时统一返回 404。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+        - providerAdminBearer: []
+      parameters:
+        - name: acting_actor_id
+          in: query
+          required: false
+          description: 可选代表 Actor；约束与查询 Actor 目录相同。
+          schema: { type: string }
+      responses:
+        "200":
+          description: >
+            actor_id 对应 Human 时 data 为 HumanActor；对应 Bot 时 data 为 BotActor，
+            BotActor 额外包含 descriptor、created_by 和 reachability。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateActor
+      tags: [actors]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40002, message: request body is invalid, condition: 请求体为空、字段不合法或没有提供任何可更新字段。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40302, message: caller is not allowed to modify the specified actor, condition: 调用身份不是目标 Actor，也不是目标 BotActor 的创建者。 }
+        "404":
+          - { code: 40401, message: actor was not found, condition: Actor 不存在，或调用方无权知道该 Actor 是否存在。 }
+      summary: 更新 Actor 公共属性
+      description: >
+        修改 name、visibility 或 collaboration_status，至少提供一个字段。HumanCookie 只能修改本人
+        HumanActor 或本人创建的 BotActor；Bot/AgentPass 只能修改自身 BotActor。Human 的 name 由外部
+        人员目录维护时，服务端可以拒绝修改。该接口不能修改 descriptor、agent_code、created_by 或 Provider。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: Actor 公共属性的部分更新，至少包含一个属性。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateActorRequest" }
+      responses:
+        "200":
+          description: 更新后的 HumanActor 或 BotActor，结构由目标 Actor kind 决定。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/bots/mine:
+    get:
+      operationId: listMyBots
+      tags: [bots]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带有效 HumanCookie。 }
+          - { code: 40101, message: credential is invalid or expired, condition: HumanCookie 无效或已经过期。 }
+      summary: 查询我的 Bot
+      description: >
+        第一版只返回 created_by 为当前 Human 工号的 BotActor，并用 relations=[creates] 显式表示关系。
+        未来可以增加 owns 而不修改路径。mine 始终由当前 HumanCookie 解析，Bot Runtime Token 和
+        AgentPass Token 不允许调用，调用方不能指定或查询其他 HumanActor。
+      security:
+        - humanCookie: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: 按 Bot 名称过滤；省略表示不按名称过滤。
+          schema: { type: string }
+        - name: collaboration_status
+          in: query
+          required: false
+          description: 按 Bot 是否接受协作过滤。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/CollaborationStatus" }
+        - name: reachability
+          in: query
+          required: false
+          description: 按 BCN 当前是否能送达 Bot 过滤。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/Reachability" }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 BotActor 及其与当前 HumanActor 的 creates/owns 关系。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorBotPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /openapi/v1/bcn/bots/discover:
+    get:
+      operationId: discoverBots
+      tags: [bots]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40001, message: request parameters are invalid, condition: 发现条件、过滤值或分页参数不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40303, message: caller is not allowed to discover bots for the specified actor, condition: 调用身份无权代表 acting_actor_id 执行 Bot 发现。 }
+      summary: 按协作意图和能力发现 Bot
+      description: >
+        根据自然语言目标和能力条件搜索或推荐 BotActor。只返回 collaboration_status=enabled 且
+        reachability=reachable 的 Bot；private Bot 不进入普通结果，protected Bot 按 acting_actor_id
+        的 Friendship 和协作权限过滤。查询参数只能缩小结果，不能绕过访问控制。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: 自然语言协作目标；省略或为空时返回推荐结果。
+          schema: { type: string }
+        - name: skills
+          in: query
+          required: false
+          description: 必须匹配的技能名，可重复传递；省略表示不按技能过滤。
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: domains
+          in: query
+          required: false
+          description: 业务或知识领域，可重复传递；省略表示不按领域过滤。
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: scopes
+          in: query
+          required: false
+          description: Bot 必须具备的 scope，可重复传递。
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: provider_id
+          in: query
+          required: false
+          description: 只发现指定 Provider 的 Bot。
+          schema: { type: string }
+        - name: acting_actor_id
+          in: query
+          required: false
+          description: 用于 Friendship 和 visibility 判断的代表 Actor；缺省规则与 Actor 目录相同。
+          schema: { type: string }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: >
+            q 有值时 data.type=search；q 省略或为空时 data.type=recommend。
+            每项包含 BotActor、匹配投影以及相对于 acting_actor_id 的 Friendship 投影。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotDiscoveryResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/bots/{actor_id}/descriptor:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    patch:
+      operationId: updateBotDescriptor
+      tags: [bots]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40002, message: request body is invalid, condition: descriptor 更新体为空、字段不合法或没有可更新字段。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40302, message: caller is not allowed to modify the specified actor, condition: 调用身份不是目标 BotActor，也不是目标 BotActor 的创建者。 }
+        "404":
+          - { code: 40401, message: actor was not found, condition: BotActor 不存在，或调用方无权知道该 BotActor 是否存在。 }
+      summary: 更新 BotDescriptor
+      description: >
+        部分更新 summary、domains、skills 或 scopes，至少提供一个字段。Bot/AgentPass 只能修改自身；
+        HumanCookie 必须是 Bot 创建者；Provider Admin 必须与 Bot 当前 ProviderBinding 匹配。
+        provider、agent_code、created_by 和 reachability 不可通过本接口修改。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+        - providerAdminBearer: []
+      requestBody:
+        required: true
+        description: BotDescriptor 的部分更新，不包含 provider。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateBotDescriptorRequest" }
+      responses:
+        "200":
+          description: 更新后的完整 BotActor。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotActorResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    botRuntimeBearer: { $ref: "../_shared.yaml#/components/securitySchemes/botRuntimeBearer" }
+    agentPassBearer: { $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearer" }
+    providerAdminBearer: { $ref: "../_shared.yaml#/components/securitySchemes/providerAdminBearer" }
+  schemas:
+    ActorPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              description: 当前页可见的 Actor。
+              items: { $ref: "../domain-models.yaml#/components/schemas/Actor" }
+    ActorPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ActorPageData" }
+    QueryActorsRequest:
+      type: object
+      required: [actor_ids]
+      properties:
+        actor_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: 要查询的 Actor ID；服务端去重并保留首次出现顺序。
+          items: { type: string }
+        acting_actor_id:
+          type: string
+          description: 可选代表 Actor；省略规则与 GET /actors 相同。
+    ActorListData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: 按请求 ID 首次出现顺序返回的可见 Actor。
+          items: { $ref: "../domain-models.yaml#/components/schemas/Actor" }
+    ActorListResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ActorListData" }
+    ActorResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Actor" }
+    BotActorResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+    UpdateActorRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: 新展示名称；省略表示不修改。
+        visibility:
+          $ref: "../domain-models.yaml#/components/schemas/ActorVisibility"
+        collaboration_status:
+          $ref: "../domain-models.yaml#/components/schemas/CollaborationStatus"
+    ActorBotPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [actor_id, items]
+          properties:
+            actor_id: { type: string, description: 被查询的 HumanActor ID。 }
+            items:
+              type: array
+              description: 与 HumanActor 存在 creates/owns 关系的 BotActor。
+              items: { $ref: "../domain-models.yaml#/components/schemas/ActorBotRelation" }
+    ActorBotPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ActorBotPageData" }
+    BotDiscoveryMatch:
+      type: object
+      required: [score, matched_skills, reason]
+      properties:
+        score: { type: number, minimum: 0, maximum: 1, description: 发现算法归一化匹配分数。 }
+        matched_skills:
+          type: array
+          description: 与本次目标或过滤条件匹配的技能名。
+          items: { type: string }
+        reason: { type: string, description: 面向调用方的简短匹配原因。 }
+    BotDiscoveryRelationship:
+      type: object
+      required: [is_friend]
+      properties:
+        is_friend: { type: boolean, description: Bot 与 acting_actor_id 是否已建立 Friendship。 }
+    BotDiscoveryItem:
+      type: object
+      required: [actor, match, relationship]
+      properties:
+        actor: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+        match: { $ref: "#/components/schemas/BotDiscoveryMatch" }
+        relationship: { $ref: "#/components/schemas/BotDiscoveryRelationship" }
+    BotDiscoveryData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items, trace_id, type]
+          properties:
+            items:
+              type: array
+              description: 当前页的 Bot 发现结果。
+              items: { $ref: "#/components/schemas/BotDiscoveryItem" }
+            trace_id: { type: string, description: 发现算法链路 ID，用于解释和排查推荐结果。 }
+            type: { type: string, enum: [search, recommend], description: q 有值为 search，否则为 recommend。 }
+    BotDiscoveryResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/BotDiscoveryData" }
+    UpdateBotDescriptorRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        summary: { type: string, description: 新的简要用途说明；省略表示不修改。 }
+        domains:
+          type: array
+          description: 完整替换领域列表；空数组表示清空，省略表示不修改。
+          items: { type: string }
+        skills:
+          type: array
+          description: 完整替换技能列表；空数组表示清空，省略表示不修改。
+          items: { $ref: "../domain-models.yaml#/components/schemas/Skill" }
+        scopes:
+          type: array
+          description: 完整替换 scope 列表；空数组表示清空，省略表示不修改。
+          items: { type: string }

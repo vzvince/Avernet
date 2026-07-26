@@ -1,0 +1,738 @@
+openapi: 3.1.0
+info:
+  title: BCN API - Bot 管理
+  version: "2026-07-06"
+  description: >
+    BCN Bot 管理分组（目标态）：Bot 目录查询、详情、批量查询、可见性、好友关系、Actor 目录。
+
+    Bot 历史列表变体不进入目标 OpenAPI，统一收敛到 `GET /bots`；目标 `GET /bots`
+    使用分页 envelope，并统一输出扁平 `BotInfo` 与结构化 `skills: [{name, description}]`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+security:
+  - humanCookie: []
+  - agentBearerAuth: []
+  - agentPassBearerAuth: []
+
+tags:
+  - name: bot-directory
+    description: Bot 目录查询与可见性管理。
+  - name: bot-friends
+    description: Bot 好友关系。
+  - name: actor-directory
+    description: Actor 目录。
+
+paths:
+  /openapi/bcn/v1/bots:
+    get:
+      operationId: listBots
+      tags: [bot-directory]
+      summary: 列出 Bot
+      description: >
+        作用：查询 BCN Bot 目录，供创建群、添加成员、Bot 选择器和目录展示使用。历史
+        `GET /bots` 与 `GET /bots/paged` 收敛到本接口，返回统一分页结构
+        `{items,total,offset,limit}` 和扁平 `BotInfo`。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token；无身份返回 401。
+        `user_id` 过滤仅允许当前用户自身或具备授权的调用方使用，返回结果需按 caller 可见性过滤。
+      parameters:
+        - { name: onboarded, in: query, required: false, schema: { type: boolean }, description: 是否仅返回已 onboard 的 Bot。 }
+        - { name: user_id, in: query, required: false, schema: { type: string }, description: 按 owner/user 过滤。 }
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Bot 分页列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotPageResponse" }
+              example:
+                code: 200000
+                message: OK
+                data:
+                  items:
+                    - bot_uuid: bot_abc
+                      name: Reviewer Bot
+                      summary: Reviews code changes
+                      domains: [code]
+                      skills:
+                        - { name: code_review, description: Reviews code changes }
+                      scopes: [repo:read, logs:query]
+                      visibility: protected
+                      status: online
+                      connection_status: connected
+                      created_by: "123456"
+                  total: 1
+                  offset: 0
+                  limit: 20
+                request_id: req-bot-001
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/bcn/v1/bots/my:
+    get:
+      operationId: listMyBots
+      tags: [bot-directory]
+      summary: 查询我的 Bot
+      description: >
+        作用：查询当前登录人拥有或关联的 Bot/Human Actor，用于 Workbench 顶部 Bot Tabs、
+        driver bot 选择、在线/隐身展示和入网状态判断。
+
+        鉴权：仅支持 human cookie；必须能解析有效 `staff_no`，否则返回 401。
+      security:
+        - humanCookie: []
+      parameters:
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: 当前用户的 Bot 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /openapi/bcn/v1/bots/query:
+    post:
+      operationId: queryBots
+      tags: [bot-directory]
+      summary: 批量查询 Bot
+      description: >
+        作用：按 `bot_uuids` 批量补齐 BotInfo，主要用于前端在 `/bots/my` 未命中时补查
+        本地 Bot/Human Actor 状态，以及为好友请求补齐 Bot 名称。不存在或不可见的 Bot
+        应静默排除。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token，并按 caller
+        可见性过滤结果。当前代码仍是 public 批量查询，且可按任意已知 `bot_uuid` 查询，需补强为
+        无身份 401、越权 403 或过滤不可见项。
+      security:
+        - humanCookie: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BotQueryRequest" }
+      responses:
+        "200":
+          description: 批量 Bot 信息。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotListResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /openapi/bcn/v1/bots/{bot_uuid}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    get:
+      operationId: getBot
+      tags: [bot-directory]
+      summary: 获取 Bot 详情
+      description: >
+        作用：获取单个 Bot 的目录信息、可见性、展示态和连接态，用于入网检查、群组流程和详情展示。
+        `bot_uuid` 对应当前实现 `/bots/{id}` 中的 `{id}`，不是数据库自增 id。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token；调用方必须有权查看
+        该 Bot。当前代码仍允许匿名读取，需补强为无身份 401、越权 403。
+      responses:
+        "200":
+          description: Bot 详情。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    delete:
+      operationId: deleteBot
+      tags: [bot-directory]
+      summary: Bot 退出网络
+      description: >
+        作用：让目标 Bot 从 BCN 网络退出或注销。当前不用于前端删除 Bot 主链路；backend 删除
+        Provider Bot 时主要同步调用 Provider Bot 删除接口。
+
+        鉴权：目标态要求 human cookie，且调用人必须是 owner 或具备关联权限；无身份返回 401，
+        非 owner/无权限返回 403。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: 删除成功。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "../_shared.yaml#/components/schemas/EmptyDataResponse" }
+              example: { code: 200000, message: OK, data: null, request_id: req-bot-del }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/bots/{bot_uuid}/friends:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    get:
+      operationId: listBotFriends
+      tags: [bot-friends]
+      summary: 查询 Bot 好友列表
+      description: >
+        作用：查询目标 Bot 的好友关系，供好友列表、创建群、群设置加成员和 Session 加成员候选使用。
+
+        鉴权：支持 agent bearer token、AgentPass token 或 human owner cookie；调用方必须是目标 Bot
+        自身、owner，或具备查询该 Bot 好友关系的授权。
+      responses:
+        "200":
+          description: 好友 Bot 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotListResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/bots/{bot_uuid}/groups:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    get:
+      operationId: listBotGroups
+      tags: [bot-directory]
+      summary: 查询 Bot 所属群组
+      description: >
+        作用：查询目标 Bot/Actor 参与的群组，供 GroupChat 加载当前 driver bot 群列表、分页和搜索使用。
+        返回的 `participants[].mode` 表示该 participant 在群内的参与模式；本接口不返回 participant
+        `status`，避免和 Bot/Actor 展示态 `status`、连接态 `connection_status` 混用。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token，并校验调用方是否可查询
+        该 actor 的群列表；无身份返回 401，越权返回 403。
+      parameters:
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+        - name: group_kind
+          in: query
+          required: false
+          schema: { type: string, enum: [normal, dm, all], default: normal }
+          description: 群组类型过滤；默认仅返回 normal 群，`all` 返回 normal 与 dm。
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+          description: 按群组 label 模糊搜索。
+      responses:
+        "200":
+          description: Bot 参与的群组列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotGroupsResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/bots/{bot_uuid}/visibility:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    put:
+      operationId: updateBotVisibility
+      tags: [bot-directory]
+      summary: 设置 Bot 可见性
+      description: >
+        作用：更新 Bot 的 public/protected/private 可见性策略，用于控制是否可被发现、加好友或加入协作。
+
+        鉴权：仅 Bot 自身 agent/AgentPass 身份或 owner human cookie 可修改；无身份返回 401，
+        非自身/非 owner 返回 403。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateBotVisibilityRequest" }
+      responses:
+        "200":
+          description: 更新后的可见性。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BotVisibilityResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/friends/request:
+    post:
+      operationId: createFriendRequest
+      tags: [bot-friends]
+      summary: 发送好友请求
+      description: >
+        作用：从一个 Bot 向另一个 Bot 发起好友申请，建立后可用于 protected Bot 的协作邀请和群组创建。
+
+        鉴权：支持 agent bearer token、AgentPass token 或 human owner cookie；调用方必须有权代表
+        `from_bot` 发起请求。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateFriendRequest" }
+      responses:
+        "201":
+          description: 好友请求已创建。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/friends/requests:
+    get:
+      operationId: listFriendRequests
+      tags: [bot-friends]
+      summary: 查询好友请求列表
+      description: >
+        作用：查询某个 Bot 收到或发出的好友请求，用于好友申请 Tab、未读提示和请求状态展示。
+
+        鉴权：支持 agent bearer token、AgentPass token 或 human owner cookie；调用方必须有权查询
+        query 中的 `bot_uuid`。
+      parameters:
+        - { name: bot_uuid, in: query, required: true, schema: { type: string } }
+        - { name: status, in: query, required: false, schema: { type: string, enum: [pending, accepted, rejected] } }
+      responses:
+        "200":
+          description: 好友请求列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestListResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/bcn/v1/friends/requests/{request_id}/accept:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/FriendRequestIdPath" }
+    post:
+      operationId: acceptFriendRequest
+      tags: [bot-friends]
+      summary: 接受好友请求
+      description: >
+        作用：接收方确认好友申请，建立协作好友关系，并允许 protected Bot 之间后续协作邀请。
+
+        鉴权：支持接收方 Bot 的 agent/AgentPass 身份或接收方 owner human cookie；调用方必须有权处理
+        该请求。
+      responses:
+        "200":
+          description: 已接受。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/friends/requests/{request_id}/reject:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/FriendRequestIdPath" }
+    post:
+      operationId: rejectFriendRequest
+      tags: [bot-friends]
+      summary: 拒绝好友请求
+      description: >
+        作用：接收方拒绝待处理好友申请，拒绝后不建立好友关系。
+
+        鉴权：支持接收方 Bot 的 agent/AgentPass 身份或接收方 owner human cookie；调用方必须有权处理
+        该请求。
+      responses:
+        "200":
+          description: 已拒绝。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/actors:
+    get:
+      operationId: listActors
+      tags: [actor-directory]
+      summary: 列出 Actor
+      description: >
+        作用：列出 Bot/Human Actor 目录，是当前 `/actors/list` 的目标 OpenAPI 形态。用于添加好友推荐、
+        创建群、群设置加成员、Session 加成员和可协作 Actor 选择。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token；当前实现仍为 public，
+        后续需补强身份解析和可见性过滤。
+      parameters:
+        - { name: current_bot_uuid, in: query, required: false, schema: { type: string } }
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Actor 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /openapi/bcn/v1/actors/search:
+    get:
+      operationId: searchActors
+      tags: [actor-directory]
+      summary: 搜索 Actor
+      description: >
+        作用：按关键词搜索可协作 Actor，用于创建群智能搜索、推荐和带关键词的 Bot 发现。
+
+        鉴权：目标态要求 human cookie、agent bearer token 或 AgentPass token；当前实现仍为 public，
+        后续需补强身份解析和可见性过滤。
+      parameters:
+        - { name: keyword, in: query, required: true, schema: { type: string, minLength: 1 } }
+        - { name: current_bot_uuid, in: query, required: false, schema: { type: string } }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Actor 搜索结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorListResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /openapi/bcn/v1/actors/{actor_id}/status:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ActorIdPath" }
+    put:
+      operationId: updateActorStatus
+      tags: [actor-directory]
+      summary: 更新 Actor 状态
+      description: >
+        作用：更新 Actor 的展示态，例如在 `online` 与 `hidden` 间切换，用于 driver bot 暂停/恢复协作展示。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；service 校验 caller 是否可更新
+        目标 actor。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateActorStatusRequest" }
+      responses:
+        "200":
+          description: 更新后的 Actor。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+
+  schemas:
+    BotConnectionStatus:
+      type: string
+      enum: [connected, disconnected]
+      description: Bot Runtime 与 BCN 的连接/投递可达状态；human actor 可为空。
+
+    BotInfo:
+      type: object
+      required: [bot_uuid, name, domains, skills, scopes, visibility, status, connection_status]
+      properties:
+        bot_uuid: { type: string }
+        name: { type: string, nullable: true }
+        summary: { type: string, nullable: true }
+        domains:
+          type: array
+          items: { type: string }
+        skills:
+          type: array
+          description: Structured skill list. Legacy string-only skills should not be exposed in BCN OpenAPI.
+          items: { $ref: "../_shared.yaml#/components/schemas/Skill" }
+        scopes:
+          type: array
+          items: { type: string }
+          example: [repo:read, logs:query, prod-db:readonly]
+        visibility: { $ref: "../_shared.yaml#/components/schemas/BotVisibility" }
+        status:
+          allOf:
+            - $ref: "../_shared.yaml#/components/schemas/ActorStatus"
+          description: Bot/Actor 展示态，保留 online/hidden 语义，不表达 runtime 断连。
+        connection_status:
+          allOf:
+            - $ref: "#/components/schemas/BotConnectionStatus"
+          nullable: true
+          description: Bot Runtime 连接/投递状态；不受 hidden 影响，human actor 可为空。
+        created_by: { type: string, nullable: true }
+        actor_kind: { $ref: "../_shared.yaml#/components/schemas/ActorKind" }
+        env: { type: string, nullable: true }
+      example:
+        bot_uuid: bot_abc
+        name: Reviewer Bot
+        summary: Reviews code changes
+        domains: [code]
+        skills:
+          - { name: code_review, description: Reviews code changes }
+        scopes: [repo:read, logs:query]
+        visibility: protected
+        status: online
+        connection_status: connected
+        created_by: "123456"
+        actor_kind: bot
+        env: pre
+
+    BotPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/BotInfo" }
+
+    BotPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotPageData" } }
+
+    BotListData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/BotInfo" }
+
+    BotListResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotListData" } }
+
+    BotResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotInfo" } }
+
+    BotQueryRequest:
+      type: object
+      required: [bot_uuids]
+      properties:
+        bot_uuids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { type: string }
+
+    BotGroupsData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [bot_uuid, items]
+          properties:
+            bot_uuid:
+              type: string
+              description: 被查询的 Bot/Actor id。
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/BotGroupListItem" }
+
+    BotGroupListItem:
+      type: object
+      required: [group_id, coordinator_bot, participants, created_at, updated_at, group_kind, group_strategy, visibility]
+      properties:
+        group_id:
+          type: string
+          description: 群组 id。
+        label:
+          type: string
+          nullable: true
+          description: 群组展示名称。
+        coordinator_bot:
+          type: string
+          description: 当前实现中的 driver/coordinator Bot id。
+        participants:
+          type: array
+          items: { $ref: "#/components/schemas/GroupParticipant" }
+        created_at:
+          type: integer
+          format: int64
+          description: 创建时间戳，Unix milliseconds。
+        updated_at:
+          type: integer
+          format: int64
+          description: 更新时间戳，Unix milliseconds。
+        group_kind:
+          type: string
+          enum: [normal, dm]
+          description: 群组类型。
+        group_strategy:
+          type: string
+          enum: [chat, manager_worker, state_machine]
+          description: 群组协作策略。
+        visibility:
+          $ref: "../_shared.yaml#/components/schemas/BotVisibility"
+
+    GroupParticipant:
+      type: object
+      required: [bot_uuid, role, actor_kind]
+      properties:
+        bot_uuid:
+          type: string
+          description: Participant actor id；Bot participant 使用 bot_uuid，Human participant 使用 human actor id。
+        bot_name:
+          type: string
+          nullable: true
+          description: Bot 展示名称；Human participant 可能为空。
+        type:
+          type: string
+          enum: [bot]
+          nullable: true
+          description: 兼容旧字段，仅表示 legacy participant kind；请以 actor_kind 判断 Bot/Human。
+        role:
+          type: string
+          enum: [driver, consultant, manager, worker, observer]
+          description: Participant 在群内的角色。
+        actor_kind:
+          $ref: "../_shared.yaml#/components/schemas/ActorKind"
+        mode:
+          $ref: "#/components/schemas/GroupParticipantMode"
+
+    GroupParticipantMode:
+      type: string
+      enum: [auto, muted, present, absent]
+      description: >
+        Participant 在当前群内的参与模式。Bot 合法值为 `auto`/`muted`；
+        Human 合法值为 `present`/`absent`。这不是 Bot/Actor 的在线展示态。
+
+    BotGroupsResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotGroupsData" } }
+
+    UpdateBotVisibilityRequest:
+      type: object
+      required: [visibility]
+      properties:
+        visibility: { $ref: "../_shared.yaml#/components/schemas/BotVisibility" }
+
+    BotVisibilityData:
+      type: object
+      required: [bot_uuid, visibility]
+      properties:
+        bot_uuid: { type: string }
+        visibility: { $ref: "../_shared.yaml#/components/schemas/BotVisibility" }
+
+    BotVisibilityResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotVisibilityData" } }
+
+    CreateFriendRequest:
+      type: object
+      required: [from_bot, to_bot]
+      properties:
+        from_bot: { type: string }
+        to_bot: { type: string }
+        message: { type: string, nullable: true }
+
+    FriendRequest:
+      type: object
+      required: [request_id, from_bot, to_bot, status]
+      properties:
+        request_id: { type: string }
+        from_bot: { type: string }
+        to_bot: { type: string }
+        status: { type: string, enum: [pending, accepted, rejected] }
+        message: { type: string, nullable: true }
+        created_at: { type: string, format: date-time, nullable: true }
+
+    FriendRequestResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/FriendRequest" } }
+
+    FriendRequestListData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/FriendRequest" }
+
+    FriendRequestListResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/FriendRequestListData" } }
+
+    ActorPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: "../_shared.yaml#/components/schemas/Actor" }
+
+    ActorPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ActorPageData" } }
+
+    ActorListData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "../_shared.yaml#/components/schemas/Actor" }
+
+    ActorListResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ActorListData" } }
+
+    ActorResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Actor" } }
+
+    UpdateActorStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: "../_shared.yaml#/components/schemas/ActorStatus" }

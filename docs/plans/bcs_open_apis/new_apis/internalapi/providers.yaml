@@ -1,0 +1,143 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - Providers
+  version: "2026-07-20"
+  description: Provider 入网和初始凭证签发，不向普通 OpenAPI 调用方开放。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: providers
+    description: Provider 配置、接入和生命周期。
+
+paths:
+  /api/v1/bcn/providers:
+    post:
+      operationId: createProviderInternal
+      tags: [providers]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "400":
+          - { code: 40012, message: provider configuration is invalid, condition: slug、supported_conn_types、gateway_config 或其他 Provider 配置不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求缺少 Internal Service Token 或 HumanCookie。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 任一所需凭证无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务或登录人不具备创建 Provider 的联合权限。 }
+        "409":
+          - { code: 40912, message: provider already exists, condition: provider_id 或 slug 已经被现有 Provider 使用。 }
+      summary: 创建 Provider
+      description: >
+        仅 BCN 管理服务和已登录管理人共同授权。slug、name、supported_conn_types 必填且 slug 创建后
+        不可修改。supported_conn_types 包含 gateway 时 gateway_config 必填；纯 plugin Provider 不需要
+        webhook。Provider Admin Token 总是只返回一次；只有包含 gateway 时才额外返回 BCN 到 Provider
+        的下行 token。BCN 默认 Provider 由系统初始化，不通过该接口创建。
+      security:
+        - internalServiceBearer: []
+          humanCookie: []
+      requestBody:
+        required: true
+        description: Provider 身份、支持的连接方式和条件 Gateway 配置。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProviderRequest" }
+      responses:
+        "201":
+          description: >
+            plugin-only 输入返回 PluginProviderCreatedData，只含 provider_admin_token；
+            supported_conn_types 包含 gateway 时返回 GatewayProviderCreatedData，同时含
+            provider_admin_token 和 bcs_to_provider_token。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderCreatedResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    internalServiceBearer: { $ref: "../_shared.yaml#/components/securitySchemes/internalServiceBearer" }
+  schemas:
+    CreateProviderBase:
+      type: object
+      required: [slug, name, supported_conn_types]
+      properties:
+        slug: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,62}$", description: 稳定可读标识，创建后不可修改。 }
+        name: { type: string, minLength: 1, description: Provider 展示名称。 }
+        supported_conn_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Provider 可以为不同 Bot 提供的连接方式。
+          items: { $ref: "../domain-models.yaml#/components/schemas/ProviderConnectionType" }
+    PluginOnlyProviderRequest:
+      allOf:
+        - $ref: "#/components/schemas/CreateProviderBase"
+        - type: object
+          required: [supported_conn_types]
+          additionalProperties: false
+          properties:
+            slug: { type: string, description: 稳定可读标识，创建后不可修改。 }
+            name: { type: string, description: Provider 展示名称。 }
+            supported_conn_types:
+              type: array
+              minItems: 1
+              maxItems: 1
+              items: { type: string, const: plugin }
+              description: 纯 Plugin Provider 固定只包含 plugin。
+    GatewayProviderRequest:
+      allOf:
+        - $ref: "#/components/schemas/CreateProviderBase"
+        - type: object
+          required: [supported_conn_types, gateway_config]
+          properties:
+            supported_conn_types:
+              type: array
+              minItems: 1
+              uniqueItems: true
+              contains: { const: gateway }
+              description: 必须包含 gateway，也可以同时包含 plugin。
+              items: { $ref: "../domain-models.yaml#/components/schemas/ProviderConnectionType" }
+            gateway_config: { $ref: "../domain-models.yaml#/components/schemas/ProviderGatewayConfig" }
+      description: supported_conn_types 必须包含 gateway，可以同时包含 plugin。
+    CreateProviderRequest:
+      oneOf:
+        - $ref: "#/components/schemas/PluginOnlyProviderRequest"
+        - $ref: "#/components/schemas/GatewayProviderRequest"
+      description: 是否包含 gateway 决定 gateway_config 和返回凭证结构。
+    PluginProviderCredentials:
+      type: object
+      required: [provider_admin_token]
+      properties:
+        provider_admin_token: { type: string, description: Provider 管理凭证，只在创建成功时返回。 }
+    GatewayProviderCredentials:
+      type: object
+      required: [provider_admin_token, bcs_to_provider_token]
+      properties:
+        provider_admin_token: { type: string, description: Provider 管理凭证，只在创建成功时返回。 }
+        bcs_to_provider_token: { type: string, description: BCN 调用 Provider Gateway 的下行凭证，只返回一次。 }
+    PluginProviderCreatedData:
+      type: object
+      required: [provider, credentials]
+      properties:
+        provider: { $ref: "../domain-models.yaml#/components/schemas/Provider" }
+        credentials: { $ref: "#/components/schemas/PluginProviderCredentials" }
+    GatewayProviderCreatedData:
+      type: object
+      required: [provider, credentials]
+      properties:
+        provider: { $ref: "../domain-models.yaml#/components/schemas/Provider" }
+        credentials: { $ref: "#/components/schemas/GatewayProviderCredentials" }
+    ProviderCreatedData:
+      oneOf:
+        - $ref: "#/components/schemas/PluginProviderCreatedData"
+        - $ref: "#/components/schemas/GatewayProviderCreatedData"
+    ProviderCreatedResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ProviderCreatedData" }

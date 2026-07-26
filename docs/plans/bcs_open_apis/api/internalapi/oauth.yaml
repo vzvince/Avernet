@@ -1,0 +1,184 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - OAuth
+  version: "2026-07-06"
+  description: >
+    BCN/BCS OAuth 内部接口。REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: oauth
+    description: OAuth 登录态。
+
+paths:
+  /api/bcn/v1/auth/url:
+    get:
+      operationId: getOAuthUrl
+      tags: [oauth]
+      summary: 获取 OAuth 授权 URL
+      description: >
+        作用：生成指定 OAuth provider 的授权 URL，供前端跳转到登录授权页。
+
+        鉴权：当前实现为 public；返回的 state/redirect 由后续 callback 校验。
+      security: []
+      parameters:
+        - { name: provider, in: query, required: true, schema: { type: string } }
+        - { name: redirect_uri, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: OAuth 授权 URL。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthUrlResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+
+  /api/bcn/v1/auth/callback/{provider}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/OAuthProviderPath" }
+    get:
+      operationId: handleOAuthCallback
+      tags: [oauth]
+      summary: OAuth 回调
+      description: >
+        作用：处理 OAuth provider 回调，交换授权 code，建立 BCN OAuth session 并返回用户信息。
+
+        鉴权：校验 callback 中的 signed state/token 以及 provider 参数；code 无效或 state 不匹配返回 400/401。
+      security:
+        - signedToken: []
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OAuth 登录结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthUserResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/auth/logout:
+    post:
+      operationId: logoutOAuthSession
+      tags: [oauth]
+      summary: 登出
+      description: >
+        作用：清理当前 OAuth session cookie。
+
+        鉴权：支持 OAuth session cookie；无 session 时也允许幂等登出。
+      security:
+        - oauthSessionCookie: []
+        - {}
+      responses:
+        "200":
+          description: 登出结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "../_shared.yaml#/components/schemas/EmptyDataResponse" }
+
+  /api/bcn/v1/auth/refresh:
+    post:
+      operationId: refreshOAuthSession
+      tags: [oauth]
+      summary: 刷新 session
+      description: >
+        作用：刷新当前 OAuth session，并返回刷新后的用户信息。
+
+        鉴权：要求有效 OAuth session cookie；无效或过期返回 401。
+      security:
+        - oauthSessionCookie: []
+      responses:
+        "200":
+          description: 刷新后的用户信息。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthUserResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/auth/user:
+    get:
+      operationId: getCurrentOAuthUser
+      tags: [oauth]
+      summary: 当前 OAuth 用户
+      description: >
+        作用：返回当前 OAuth session 对应的用户资料，backend OAuth 插件可用它把 BCS 登录态映射为业务身份。
+
+        鉴权：要求有效 OAuth session cookie。
+      security:
+        - oauthSessionCookie: []
+      responses:
+        "200":
+          description: 当前 OAuth 用户。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthUserResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/auth/user/{user_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/UserIdPath" }
+    get:
+      operationId: getOAuthUserById
+      tags: [oauth]
+      summary: 指定 OAuth 用户
+      description: >
+        作用：查询指定 OAuth 用户资料，主要用于 OAuth 启用后的内部自查。
+
+        鉴权：要求有效 OAuth session cookie，且 path `user_id` 必须等于 session JWT subject，否则返回 403。
+      security:
+        - oauthSessionCookie: []
+      responses:
+        "200":
+          description: OAuth 用户信息。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OAuthUserResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    oauthSessionCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/oauthSessionCookie"
+    signedToken:
+      $ref: "../_shared.yaml#/components/securitySchemes/signedToken"
+
+  schemas:
+    OAuthUrlData:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string }
+        state: { type: string, nullable: true }
+
+    OAuthUrlResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/OAuthUrlData" } }
+
+    OAuthUser:
+      type: object
+      required: [user_id]
+      properties:
+        user_id: { type: string }
+        provider: { type: string, nullable: true }
+        display_name: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+
+    OAuthUserResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/OAuthUser" } }

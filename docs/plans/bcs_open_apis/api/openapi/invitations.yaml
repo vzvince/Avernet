@@ -1,0 +1,169 @@
+openapi: 3.1.0
+info:
+  title: BCN API - 邀请
+  version: "2026-07-06"
+  description: >
+    BCN 邀请分组（目标态）：Group/Session invite link 创建，以及通过 signed invite token 加入。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+security:
+  - humanCookie: []
+  - agentBearerAuth: []
+  - agentPassBearerAuth: []
+
+tags:
+  - name: invitations
+    description: Group/Session 邀请。
+
+paths:
+  /openapi/bcn/v1/groups/{group_id}/invite-link:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    post:
+      operationId: createGroupInviteLink
+      tags: [invitations]
+      summary: 创建群组邀请链接
+      description: >
+        作用：为 group 生成可分享的邀请加入链接，前端群设置中用于复制或分享群邀请。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；service 校验 caller 是 group
+        driver/originator 或其 owner，且 group 允许邀请。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInviteLinkRequest" }
+      responses:
+        "201":
+          description: 邀请链接。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InviteLinkResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/sessions/{session_id}/invite-link:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    post:
+      operationId: createSessionInviteLink
+      tags: [invitations]
+      summary: 创建 Session 邀请链接
+      description: >
+        作用：为 Session 生成可分享的邀请加入链接，前端 Session 设置和 bcs-cli 可使用该接口生成链接。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；service 校验 caller 对 session/group
+        具备邀请权限。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInviteLinkRequest" }
+      responses:
+        "201":
+          description: 邀请链接。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InviteLinkResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/groups/join/{token}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/InviteTokenPath" }
+    post:
+      operationId: joinGroupByInvite
+      tags: [invitations]
+      summary: 通过邀请加入群组
+      description: >
+        作用：人类用户通过 signed invite token 加入 group，前端邀请页确认后调用。
+
+        鉴权：需要 human cookie，并校验 path 中的 signed invite token、过期时间和资源绑定；成功后确保
+        `human_{staff_no}` actor 存在并加入 group。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: 加入后的群组。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinGroupResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+
+  /openapi/bcn/v1/sessions/join/{token}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/InviteTokenPath" }
+    post:
+      operationId: joinSessionByInvite
+      tags: [invitations]
+      summary: 通过邀请加入 Session
+      description: >
+        作用：人类用户通过 signed invite token 加入 Session，前端邀请页确认后调用。
+
+        鉴权：需要 human cookie，并校验 path 中的 signed invite token、过期时间和资源绑定；成功后确保
+        `human_{staff_no}` actor 存在并加入 session。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: 加入后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JoinSessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+
+  schemas:
+    CreateInviteLinkRequest:
+      type: object
+      properties:
+        expires_in_seconds: { type: integer, minimum: 60, nullable: true }
+        max_uses: { type: integer, minimum: 1, nullable: true }
+
+    InviteLinkResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/InviteLink" } }
+
+    JoinGroupResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Group" } }
+
+    JoinSessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Session" } }

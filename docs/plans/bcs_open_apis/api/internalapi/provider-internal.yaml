@@ -1,0 +1,183 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - Provider 内部
+  version: "2026-07-06"
+  description: >
+    BCN/BCS Provider 内部管理接口。REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: provider-internal
+    description: Provider 内部管理。
+
+paths:
+  /api/bcn/v1/providers:
+    post:
+      operationId: createInternalProvider
+      tags: [provider-internal]
+      summary: 注册 Provider
+      description: >
+        作用：内部创建 Provider 配置，并生成 provider admin/runtime token。
+
+        鉴权：要求 human cookie；service 记录创建人并生成 Provider 凭证。
+      security:
+        - humanCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProviderRequest" }
+      responses:
+        "201":
+          description: Provider 创建结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateProviderResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /api/bcn/v1/providers/{provider_id}/disable:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+    post:
+      operationId: disableProvider
+      tags: [provider-internal]
+      summary: 停用 Provider
+      description: >
+        作用：停用 Provider，使其后续管理、投递或回调能力不可用。
+
+        鉴权：同时要求 provider admin bearer token 和 human cookie；service 校验 provider 与操作人权限。
+      security:
+        - providerAdminBearer: []
+          humanCookie: []
+      responses:
+        "200":
+          description: 停用后的 Provider。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/providers/{provider_id}/enable:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+    post:
+      operationId: enableProvider
+      tags: [provider-internal]
+      summary: 启用 Provider
+      description: >
+        作用：重新启用已停用的 Provider。
+
+        鉴权：同时要求 provider admin bearer token 和 human cookie；service 校验 provider 与操作人权限。
+      security:
+        - providerAdminBearer: []
+          humanCookie: []
+      responses:
+        "200":
+          description: 启用后的 Provider。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/providers/{provider_id}/delivery/switch-bot:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+    post:
+      operationId: switchProviderBotDelivery
+      tags: [provider-internal]
+      summary: 切换 Provider Bot 投递方式
+      description: >
+        作用：将指定 Provider Bot 的投递方式切换到目标 delivery，用于灰度、迁移或内部调试。
+
+        鉴权：要求 provider admin bearer token；service 校验 provider、provider bot ref 和允许切换的 provider 列表。
+      security:
+        - providerAdminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SwitchProviderBotDeliveryRequest" }
+      responses:
+        "200":
+          description: 切换结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SwitchProviderBotDeliveryResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    providerAdminBearer:
+      $ref: "../_shared.yaml#/components/securitySchemes/providerAdminBearer"
+
+  schemas:
+    CreateProviderRequest:
+      type: object
+      required: [provider_id]
+      properties:
+        provider_id: { type: string }
+        name: { type: string, nullable: true }
+        auth_mode: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+
+    CreateProviderData:
+      type: object
+      required: [provider_id, provider_admin_token]
+      properties:
+        provider_id: { type: string }
+        provider_admin_token: { type: string }
+        provider_runtime_token: { type: string, nullable: true }
+
+    CreateProviderResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/CreateProviderData" } }
+
+    ProviderResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Provider" } }
+
+    SwitchProviderBotDeliveryRequest:
+      type: object
+      required: [provider_bot_ref, target_delivery]
+      properties:
+        provider_bot_ref: { type: string }
+        target_delivery: { type: string }
+        reason: { type: string, nullable: true }
+
+    SwitchProviderBotDeliveryData:
+      type: object
+      required: [provider_id, provider_bot_ref, target_delivery]
+      properties:
+        provider_id: { type: string }
+        provider_bot_ref: { type: string }
+        target_delivery: { type: string }
+
+    SwitchProviderBotDeliveryResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/SwitchProviderBotDeliveryData" } }

@@ -1,0 +1,240 @@
+openapi: 3.1.0
+info:
+  title: BCN API - Provider 管理
+  version: "2026-07-07"
+  description: >
+    BCN Provider 管理分组（目标态）：Provider 配置查询/更新、Provider Bot binding
+    的列表/注册/删除。Provider 内部注册、灰度、enable/disable 等接口不进入外部 OpenAPI。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+security:
+  - providerAdminBearer: []
+
+tags:
+  - name: provider-management
+    description: Provider 管理。
+  - name: provider-bots
+    description: Provider Bot binding 管理。
+
+paths:
+  /openapi/bcn/v1/providers/{provider_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+    get:
+      operationId: getProvider
+      tags: [provider-management]
+      summary: 获取 Provider
+      description: >
+        作用：查询 Provider 配置和集成元数据，用于 Provider 下行调试、控制台展示和集成校验。
+
+        鉴权：要求 provider admin bearer token，且 token 必须与 path `provider_id` 匹配；响应不得泄露
+        `provider_admin_token` 或 `bcs_to_provider_token`。
+      security:
+        - providerAdminBearer: []
+      responses:
+        "200":
+          description: Provider 配置。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateProvider
+      tags: [provider-management]
+      summary: 更新 Provider
+      description: >
+        作用：更新 Provider 的名称、webhook、协作配置等可变元数据；auth mode 等敏感配置不应通过普通
+        PATCH 修改。
+
+        鉴权：当前实现同时要求 provider admin token 和 human cookie；目标态保留该约束，并由 service
+        校验 provider 与操作人权限。
+      security:
+        - providerAdminBearer: []
+          humanCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProviderRequest" }
+      responses:
+        "200":
+          description: 更新后的 Provider。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/providers/{provider_id}/bots:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+    get:
+      operationId: listProviderBots
+      tags: [provider-bots]
+      summary: 查询 Provider Bot 列表
+      description: >
+        作用：查询某个 Provider 下注册的 Bot binding，用于 Provider 控制台、mock provider 和集成测试
+        查看绑定关系。
+
+        鉴权：要求 provider admin bearer token，且 token 必须与 path `provider_id` 匹配；列表响应不得泄露
+        `bot_runtime_token`。
+      security:
+        - providerAdminBearer: []
+      parameters:
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Provider Bot binding 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderBotPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    post:
+      operationId: createProviderBot
+      tags: [provider-bots]
+      summary: 注册 Provider Bot
+      description: >
+        作用：将 Provider 侧 Bot 映射注册到 BCS，创建或复用 Provider Bot binding，并返回 Bot Runtime
+        连接所需 token。backend 在 TeamClaw Bot 创建/启动时会通过该接口同步注册 Provider Bot。
+
+        鉴权：要求 provider admin bearer token，且 token 必须与 path `provider_id` 匹配。`skills` 使用结构化
+        `{name, description}` 形式，不暴露历史字符串数组格式。
+      security:
+        - providerAdminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProviderBotRequest" }
+            example:
+              provider_bot_ref: reviewer-v2
+              capabilities:
+                name: Reviewer Bot
+                summary: Reviews code changes
+                skills:
+                  - { name: code_review, description: Reviews code changes }
+                  - { name: sql_analysis, description: Analyzes SQL }
+                scopes: [repo:read, logs:query]
+                visibility: protected
+      responses:
+        "201":
+          description: 注册成功。当前实现只返回 binding 关键字段和 bot runtime token。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateProviderBotResponse" }
+              example:
+                code: 201000
+                message: OK
+                data:
+                  bot_uuid: bot_abc
+                  provider_id: provider_abc
+                  provider_bot_ref: reviewer-v2
+                  bot_runtime_token: runtime-token
+                request_id: req-provider-bot-001
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/providers/{provider_id}/bots/{provider_bot_ref}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderIdPath" }
+      - { $ref: "../_shared.yaml#/components/parameters/ProviderBotRefPath" }
+    delete:
+      operationId: deleteProviderBot
+      tags: [provider-bots]
+      summary: 删除 Provider Bot binding
+      description: >
+        作用：删除 Provider Bot 与 BCN Bot 的映射；backend 删除本地 Bot 后会 best-effort 同步删除该 binding。
+
+        鉴权：要求 provider admin bearer token，且 token 必须与 path `provider_id` 匹配；目标不存在时按幂等删除处理。
+      security:
+        - providerAdminBearer: []
+      responses:
+        "200":
+          description: 删除成功。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "../_shared.yaml#/components/schemas/EmptyDataResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    providerAdminBearer:
+      $ref: "../_shared.yaml#/components/securitySchemes/providerAdminBearer"
+
+  schemas:
+    ProviderResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Provider" } }
+
+    UpdateProviderRequest:
+      type: object
+      properties:
+        name: { type: string }
+        enabled: { type: boolean }
+        auth_mode: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    ProviderBotPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: "../_shared.yaml#/components/schemas/ProviderBotBinding" }
+
+    ProviderBotPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ProviderBotPageData" } }
+
+    CreateProviderBotRequest:
+      type: object
+      required: [provider_bot_ref, capabilities]
+      properties:
+        provider_bot_ref: { type: string }
+        capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+        metadata: { type: object, additionalProperties: true }
+
+    CreateProviderBotData:
+      type: object
+      required: [bot_uuid, provider_id, provider_bot_ref, bot_runtime_token]
+      properties:
+        bot_uuid: { type: string }
+        provider_id: { type: string }
+        provider_bot_ref: { type: string }
+        bot_runtime_token: { type: string }
+
+    CreateProviderBotResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/CreateProviderBotData" } }

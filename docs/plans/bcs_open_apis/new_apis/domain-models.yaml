@@ -1,0 +1,752 @@
+openapi: 3.1.0
+info:
+  title: BCN Domain Models
+  version: "2026-07-20"
+  description: >
+    BCN 目标领域对象的权威 wire schema。BCN 的核心对象为 Actor、Group 和 Session；
+    Provider、Friendship、Invitation、Message、CollaborationTemplate 和 StateMachineRun
+    是支撑对象或从属对象。
+paths: {}
+
+components:
+  schemas:
+    ActorKind:
+      type: string
+      enum: [human, bot]
+      description: Actor 具体类型。
+    ActorVisibility:
+      type: string
+      enum: [public, protected, private]
+      description: Actor 的发现和协作可见范围。
+    CollaborationStatus:
+      type: string
+      enum: [enabled, paused]
+      description: Actor 是否接受 BCN 协作；不表达网络连接状态。
+    Reachability:
+      type: string
+      enum: [reachable, unreachable]
+      description: BCN 当前能否通过 Plugin 或 Provider Gateway 将消息送达 Bot。
+    Skill:
+      type: object
+      required: [name]
+      description: Bot 对外声明的一项可发现能力。
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: 稳定的技能名称或标识。
+        description:
+          type: string
+          description: 面向调用方的技能说明；没有补充说明时可省略。
+    ProviderReference:
+      type: object
+      required: [provider_id, slug, name]
+      description: BotDescriptor 中使用的非敏感 Provider 引用。
+      properties:
+        provider_id:
+          type: string
+          description: Provider 的权威唯一标识。
+        slug:
+          type: string
+          description: Provider 创建后不可修改的稳定可读标识。
+        name:
+          type: string
+          description: Provider 展示名称。
+    BotDescriptor:
+      type: object
+      required: [summary, domains, skills, scopes, provider]
+      description: Bot 的能力和提供方描述，不包含凭证、端点或内部路由配置。
+      properties:
+        summary:
+          type: string
+          description: Bot 的简要用途说明；没有说明时使用空字符串。
+        domains:
+          type: array
+          description: Bot 擅长的业务或知识领域；没有声明时为空数组。
+          items: { type: string }
+        skills:
+          type: array
+          description: Bot 可以完成的结构化能力列表；没有声明时为空数组。
+          items: { $ref: "#/components/schemas/Skill" }
+        scopes:
+          type: array
+          description: Bot 可以访问或操作的能力范围；没有声明时为空数组。
+          items: { type: string }
+        provider:
+          $ref: "#/components/schemas/ProviderReference"
+    ActorBase:
+      type: object
+      required: [actor_id, kind, name, visibility, collaboration_status, gmt_create, gmt_modified]
+      description: HumanActor 和 BotActor 的公共属性。
+      properties:
+        actor_id:
+          type: string
+          description: Actor 在 BCN 中的权威唯一标识。
+        kind:
+          $ref: "#/components/schemas/ActorKind"
+        name:
+          type: string
+          description: Actor 展示名称。
+        visibility:
+          $ref: "#/components/schemas/ActorVisibility"
+        collaboration_status:
+          $ref: "#/components/schemas/CollaborationStatus"
+        gmt_create:
+          type: integer
+          format: int64
+          description: 创建时间，Unix milliseconds。
+        gmt_modified:
+          type: integer
+          format: int64
+          description: 最后修改时间，Unix milliseconds。
+    HumanActor:
+      description: 参与 BCN 协作的人；第一版没有 Human 专有公开字段。
+      allOf:
+        - $ref: "#/components/schemas/ActorBase"
+        - type: object
+          required: [kind]
+          description: 参与 BCN 协作的人；第一版没有 Human 专有公开字段。
+          properties:
+            kind:
+              type: string
+              const: human
+              description: HumanActor 固定为 human。
+    BotActor:
+      description: 参与 BCN 协作的软件主体，具有能力描述、创建来源和可达性。
+      allOf:
+        - $ref: "#/components/schemas/ActorBase"
+        - type: object
+          required: [kind, created_by, descriptor, reachability]
+          description: 参与 BCN 协作的软件主体。
+          properties:
+            kind:
+              type: string
+              const: bot
+              description: BotActor 固定为 bot。
+            agent_code:
+              type: string
+              description: 外部 Agent 平台或安全网关身份；未关联时省略。
+            created_by:
+              type: string
+              description: 创建 Bot 的 Human 工号，是不可变创建来源。
+            descriptor:
+              $ref: "#/components/schemas/BotDescriptor"
+            reachability:
+              $ref: "#/components/schemas/Reachability"
+    Actor:
+      oneOf:
+        - $ref: "#/components/schemas/HumanActor"
+        - $ref: "#/components/schemas/BotActor"
+      discriminator:
+        propertyName: kind
+        mapping:
+          human: "#/components/schemas/HumanActor"
+          bot: "#/components/schemas/BotActor"
+      description: BCN 网络中可被唯一识别、授权并参与协作的主体。
+    ActorBotRelation:
+      type: object
+      required: [actor, relations]
+      description: HumanActor 与 BotActor 的关系查询投影。
+      properties:
+        actor:
+          $ref: "#/components/schemas/BotActor"
+        relations:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: 第一版为 creates；未来可增加 owns。
+          items:
+            type: string
+            enum: [creates, owns]
+
+    ProviderConnectionType:
+      type: string
+      enum: [plugin, gateway]
+      description: Plugin 表示 Bot 直连 BCN；Gateway 表示 BCN 通过 Provider 下行。
+    ProviderGatewayConfig:
+      type: object
+      required: [webhook_url, protocol_version]
+      description: Provider 支持 gateway 时使用的非敏感下行配置。
+      properties:
+        webhook_url:
+          type: string
+          format: uri
+          description: BCN 向 Provider 投递请求的 HTTPS 地址。
+        protocol_version:
+          type: string
+          description: BCN 与 Provider 使用的下行协议版本。
+    Provider:
+      type: object
+      required: [provider_id, slug, name, supported_conn_types, enabled, gmt_create, gmt_modified]
+      description: Bot 的提供方以及 Plugin/Gateway 接入能力边界。
+      properties:
+        provider_id:
+          type: string
+          description: BCN 生成的 Provider 唯一标识。
+        slug:
+          type: string
+          description: 创建后不可修改的稳定可读标识。
+        name:
+          type: string
+          description: Provider 展示名称。
+        supported_conn_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Provider 可以为不同 Bot 提供的连接方式。
+          items: { $ref: "#/components/schemas/ProviderConnectionType" }
+        gateway_config:
+          description: supported_conn_types 包含 gateway 时必须存在；查询结果不包含密钥。
+          $ref: "#/components/schemas/ProviderGatewayConfig"
+        enabled:
+          type: boolean
+          description: Provider 是否允许注册和投递 Bot。
+        gmt_create:
+          type: integer
+          format: int64
+          description: 创建时间，Unix milliseconds。
+        gmt_modified:
+          type: integer
+          format: int64
+          description: 最后修改时间，Unix milliseconds。
+      allOf:
+        - if:
+            properties:
+              supported_conn_types:
+                contains: { const: gateway }
+          then:
+            required: [gateway_config]
+    ProviderBotBinding:
+      type: object
+      required: [actor_id, provider_id, provider_bot_ref, conn_type, gmt_create, gmt_modified]
+      description: BotActor 与 Provider 的唯一有效关联和当前投递方式。
+      properties:
+        actor_id:
+          type: string
+          description: 被绑定的 BotActor ID。
+        provider_id:
+          type: string
+          description: Provider ID。
+        provider_bot_ref:
+          type: string
+          description: Bot 在该 Provider 命名空间中的唯一标识。
+        conn_type:
+          $ref: "#/components/schemas/ProviderConnectionType"
+        gmt_create:
+          type: integer
+          format: int64
+          description: Binding 创建时间，Unix milliseconds。
+        gmt_modified:
+          type: integer
+          format: int64
+          description: Binding 最后修改时间，Unix milliseconds。
+
+    Friendship:
+      type: object
+      required: [left_actor_id, right_actor_id, gmt_create]
+      description: 两个 BotActor 之间对称、无方向的协作关系；ID 按稳定规则排序保存。
+      properties:
+        left_actor_id:
+          type: string
+          description: 排序后位于左侧的 BotActor ID。
+        right_actor_id:
+          type: string
+          description: 排序后位于右侧的 BotActor ID。
+        gmt_create:
+          type: integer
+          format: int64
+          description: Friendship 建立时间，Unix milliseconds。
+    FriendRequestStatus:
+      type: string
+      enum: [pending, accepted, rejected]
+      description: FriendRequest 当前状态。
+    FriendRequest:
+      type: object
+      required: [request_id, from_actor_id, to_actor_id, status, gmt_create, gmt_modified]
+      description: 一个 BotActor 向另一个 BotActor 发起的好友关系申请。
+      properties:
+        request_id:
+          type: string
+          description: FriendRequest 唯一标识。
+        from_actor_id:
+          type: string
+          description: 发起申请的 BotActor ID。
+        to_actor_id:
+          type: string
+          description: 接收申请的 BotActor ID。
+        status:
+          $ref: "#/components/schemas/FriendRequestStatus"
+        gmt_create:
+          type: integer
+          format: int64
+          description: 申请创建时间，Unix milliseconds。
+        gmt_modified:
+          type: integer
+          format: int64
+          description: 申请最后修改时间，Unix milliseconds。
+    FriendshipEntry:
+      type: object
+      required: [actor, friendship]
+      description: 从指定 BotActor 视角返回的一条好友记录。
+      properties:
+        actor:
+          $ref: "#/components/schemas/BotActor"
+        friendship:
+          $ref: "#/components/schemas/Friendship"
+
+    GroupKind:
+      type: string
+      enum: [normal, dm]
+      description: normal 为普通群；dm 为固定双方的直接会话群。
+    GroupStatus:
+      type: string
+      enum: [active, completed, error, closed, inactive]
+      description: Group 当前状态；第一版不提供任意状态修改 API。
+    GroupVisibility:
+      type: string
+      enum: [private, public]
+      description: Group 的加入和 Session 创建可见范围。
+    GroupStrategy:
+      type: string
+      enum: [chat, manager_worker, state_machine]
+      description: Group 使用的协作策略。
+    GroupParticipantRole:
+      type: string
+      enum: [driver, consultant, observer, manager, worker]
+      description: Actor 在 Group 长期协作关系中的角色。
+    GroupParticipant:
+      type: object
+      required: [actor_id, actor_kind, role]
+      description: Actor 在 Group 中的长期成员关系；不包含 Session 参与 mode。
+      properties:
+        actor_id:
+          type: string
+          description: Actor 唯一标识。
+        actor_kind:
+          $ref: "#/components/schemas/ActorKind"
+        role:
+          $ref: "#/components/schemas/GroupParticipantRole"
+    RoutingPolicy:
+      type: object
+      required: [mode, default_delivery]
+      description: Group 的消息路由决策规则。
+      properties:
+        mode:
+          type: string
+          enum: [structured, mention, hybrid]
+          description: 路由决策模式。
+        default_delivery:
+          type: string
+          enum: [send_to_driver, inject_observers]
+          description: 没有显式路由目标时的默认投递行为。
+    CollaborationDefinitionRef:
+      type: object
+      required: [id, version]
+      description: 版本化 CollaborationDefinition 引用。
+      properties:
+        id:
+          type: string
+          description: Definition 唯一标识。
+        version:
+          type: integer
+          minimum: 1
+          description: Definition 版本。
+    CollaborationParticipantBinding:
+      type: object
+      required: [source, bot_ids, extensions]
+      description: Definition 参与者槽位到实际 BotActor 的绑定。
+      properties:
+        source:
+          type: string
+          enum: [manual]
+          description: 当前只支持人工显式绑定。
+        bot_ids:
+          type: array
+          description: 绑定到该槽位的 BotActor ID。
+          items: { type: string }
+        extensions:
+          type: object
+          additionalProperties: true
+          description: 模板定义的可选扩展；没有扩展时为空对象。
+    CollaborationBinding:
+      type: object
+      required: [definition_ref, participant_bindings, auto_start_on_service_invocation]
+      description: Group 对 CollaborationDefinition 的版本化绑定。
+      properties:
+        definition_ref:
+          $ref: "#/components/schemas/CollaborationDefinitionRef"
+        participant_bindings:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/CollaborationParticipantBinding"
+          description: 参与者槽位名称到实际 Bot 的绑定。
+        auto_start_on_service_invocation:
+          type: boolean
+          description: 创建 ServiceInvocation Session 后是否自动启动协作定义。
+    CallbackChannel:
+      type: object
+      required: [type, config]
+      description: Service Group 结果回调通道；凭证字段在查询响应中必须脱敏。
+      properties:
+        type:
+          type: string
+          enum: [antding, baas]
+          description: 回调通道类型。
+        config:
+          type: object
+          additionalProperties: true
+          description: 通道专有配置；具体必填字段由 type 决定。
+    ServiceSpec:
+      type: object
+      required: [callback_channels]
+      description: Service-as-a-Group 的调用和回调约束。
+      properties:
+        callback_channels:
+          type: array
+          items: { $ref: "#/components/schemas/CallbackChannel" }
+          description: 调用完成后使用的回调通道；不需要回调时为空数组。
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          description: 单次调用超时秒数；省略表示使用服务端默认值。
+        max_concurrency:
+          type: integer
+          minimum: 1
+          description: 最大并发调用数；省略表示使用服务端默认值。
+    Group:
+      type: object
+      required: [group_id, version, label, context, kind, status, visibility, created_by, originator, driver, participants, strategy, gmt_create, gmt_modified]
+      description: BCN 中组织 Actor 开展长期协作的空间。
+      properties:
+        group_id:
+          type: string
+          description: Group 唯一标识。
+        version:
+          type: integer
+          minimum: 1
+          description: Group 配置版本；当前实现通常为 1。
+        label:
+          type: string
+          description: 群展示名称。
+        context:
+          type: string
+          description: 建群时确定的协作目标、背景和上下文。
+        kind:
+          $ref: "#/components/schemas/GroupKind"
+        status:
+          $ref: "#/components/schemas/GroupStatus"
+        visibility:
+          $ref: "#/components/schemas/GroupVisibility"
+        created_by:
+          type: string
+          description: 实际创建人的工号，用于审计。
+        originator:
+          type: string
+          description: 群的发起和协调 Actor；缺省创建语义可回退到 driver。
+        driver:
+          type: string
+          description: 群的主执行 BotActor 和默认消息入口。
+        participants:
+          type: array
+          items: { $ref: "#/components/schemas/GroupParticipant" }
+          description: Group 的长期参与者关系。
+        strategy:
+          $ref: "#/components/schemas/GroupStrategy"
+        routing_policy:
+          description: strategy 需要显式路由时存在。
+          $ref: "#/components/schemas/RoutingPolicy"
+        collaboration:
+          description: 绑定显式 CollaborationDefinition 时存在。
+          $ref: "#/components/schemas/CollaborationBinding"
+        service_spec:
+          description: Group 对外提供 Service Invocation 时存在。
+          $ref: "#/components/schemas/ServiceSpec"
+        gmt_create:
+          type: integer
+          format: int64
+          description: 创建时间，Unix milliseconds。
+        gmt_modified:
+          type: integer
+          format: int64
+          description: 最后修改时间，Unix milliseconds。
+    GroupSummary:
+      type: object
+      required: [group_id, version, label, context, kind, status, visibility, created_by, originator, driver, participant_count, strategy, gmt_create, gmt_modified]
+      description: Group 列表使用的轻量视图，不包含完整 participants 和可选配置。
+      properties:
+        group_id: { type: string, description: Group 唯一标识。 }
+        version: { type: integer, minimum: 1, description: Group 配置版本。 }
+        label: { type: string, description: 群展示名称。 }
+        context: { type: string, description: 群协作目标和背景。 }
+        kind: { $ref: "#/components/schemas/GroupKind" }
+        status: { $ref: "#/components/schemas/GroupStatus" }
+        visibility: { $ref: "#/components/schemas/GroupVisibility" }
+        created_by: { type: string, description: 实际创建人的工号。 }
+        originator: { type: string, description: 群发起和协调 Actor。 }
+        driver: { type: string, description: 群主执行 BotActor。 }
+        participant_count: { type: integer, minimum: 0, description: 当前 GroupParticipant 数量。 }
+        message_count: { type: integer, minimum: 0, description: Group 下可见 Session 的累计消息数；未统计时省略。 }
+        strategy: { $ref: "#/components/schemas/GroupStrategy" }
+        gmt_create: { type: integer, format: int64, description: 创建时间，Unix milliseconds。 }
+        gmt_modified: { type: integer, format: int64, description: 最后修改时间，Unix milliseconds。 }
+
+    SessionKind:
+      type: string
+      enum: [chat, service_invocation]
+      description: Session 的交互类型。
+    SessionStatus:
+      type: string
+      enum: [running, completed]
+      description: Session 当前状态。
+    SessionParticipantRole:
+      type: string
+      enum: [driver, consultant, observer, manager, worker]
+      description: Actor 在当前 Session 中的角色。
+    BotParticipantMode:
+      type: string
+      enum: [auto, muted]
+      description: Bot 在 Session 中正常参与或静默参与。
+    HumanParticipantMode:
+      type: string
+      enum: [present, absent]
+      description: Human 在 Session 中当前参与或暂离。
+    BotSessionParticipant:
+      type: object
+      required: [actor_id, actor_kind, role, mode]
+      description: BotActor 的 Session 参与快照。
+      properties:
+        actor_id: { type: string, description: BotActor ID。 }
+        actor_kind: { type: string, const: bot, description: 固定为 bot。 }
+        role: { $ref: "#/components/schemas/SessionParticipantRole" }
+        mode: { $ref: "#/components/schemas/BotParticipantMode" }
+    HumanSessionParticipant:
+      type: object
+      required: [actor_id, actor_kind, role, mode]
+      description: HumanActor 的 Session 参与快照。
+      properties:
+        actor_id: { type: string, description: HumanActor ID。 }
+        actor_kind: { type: string, const: human, description: 固定为 human。 }
+        role: { $ref: "#/components/schemas/SessionParticipantRole" }
+        mode: { $ref: "#/components/schemas/HumanParticipantMode" }
+    SessionParticipant:
+      oneOf:
+        - $ref: "#/components/schemas/BotSessionParticipant"
+        - $ref: "#/components/schemas/HumanSessionParticipant"
+      discriminator:
+        propertyName: actor_kind
+        mapping:
+          bot: "#/components/schemas/BotSessionParticipant"
+          human: "#/components/schemas/HumanSessionParticipant"
+      description: Actor 在一次 Session 中独立于 GroupParticipant 的参与快照。
+    Invocation:
+      type: object
+      required: [input]
+      description: ServiceInvocation Session 专有的一次服务调用信息。
+      properties:
+        input:
+          description: 调用方提交的结构化输入。
+        output:
+          description: 调用成功后的结构化结果；未完成或失败时省略。
+        error_message:
+          type: string
+          description: 调用失败信息；未失败时省略。
+        external_caller_id:
+          type: string
+          description: 调用方声明的业务归因标识，不参与鉴权；未提供时省略。
+        callback_status:
+          type: string
+          enum: [pending, succeeded, partial_failed, failed]
+          description: 回调执行状态；未配置回调时省略。
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 调用级扩展；未提供时省略。
+    SessionBase:
+      type: object
+      required: [session_id, group_id, group_version, session_title, session_kind, status, participants, created_by, gmt_create, gmt_modified]
+      description: ChatSession 和 ServiceInvocationSession 的公共字段。
+      properties:
+        session_id: { type: string, description: Session 唯一标识。 }
+        group_id: { type: string, description: 所属 Group ID。 }
+        group_version: { type: integer, minimum: 1, description: 创建时固定的 Group 配置版本。 }
+        session_title: { type: string, description: Session 展示标题；无标题时为空字符串。 }
+        session_kind: { $ref: "#/components/schemas/SessionKind" }
+        status: { $ref: "#/components/schemas/SessionStatus" }
+        participants:
+          type: array
+          description: 当前 SessionParticipant 快照。
+          items: { $ref: "#/components/schemas/SessionParticipant" }
+        created_by: { type: string, description: 创建 Session 的 Actor 或受信任服务主体标识。 }
+        gmt_create: { type: integer, format: int64, description: 创建时间，Unix milliseconds。 }
+        gmt_modified: { type: integer, format: int64, description: 最后修改时间，Unix milliseconds。 }
+        completed_at: { type: integer, format: int64, description: 完成时间；running 时省略。 }
+    ChatSession:
+      description: 持续交互会话，不包含 invocation。
+      allOf:
+        - $ref: "#/components/schemas/SessionBase"
+        - type: object
+          required: [session_kind]
+          description: 持续交互会话，不包含 invocation。
+          properties:
+            session_kind: { type: string, const: chat, description: 固定为 chat。 }
+          not:
+            required: [invocation]
+    ServiceInvocationSession:
+      description: 一次独立服务调用及其输入、结果和错误，必须包含 invocation。
+      allOf:
+        - $ref: "#/components/schemas/SessionBase"
+        - type: object
+          required: [session_kind, invocation]
+          description: 一次独立服务调用及其输入、结果和错误。
+          properties:
+            session_kind: { type: string, const: service_invocation, description: 固定为 service_invocation。 }
+            invocation: { $ref: "#/components/schemas/Invocation" }
+    Session:
+      oneOf:
+        - $ref: "#/components/schemas/ChatSession"
+        - $ref: "#/components/schemas/ServiceInvocationSession"
+      discriminator:
+        propertyName: session_kind
+        mapping:
+          chat: "#/components/schemas/ChatSession"
+          service_invocation: "#/components/schemas/ServiceInvocationSession"
+      description: Group 中一次相互隔离的协作上下文。
+    SessionSummary:
+      type: object
+      required: [session_id, group_id, session_title, session_kind, status, participant_count, gmt_create, gmt_modified]
+      description: Session 列表使用的轻量视图。
+      properties:
+        session_id: { type: string, description: Session 唯一标识。 }
+        group_id: { type: string, description: 所属 Group ID。 }
+        session_title: { type: string, description: Session 标题；无标题时为空字符串。 }
+        session_kind: { $ref: "#/components/schemas/SessionKind" }
+        status: { $ref: "#/components/schemas/SessionStatus" }
+        participant_count: { type: integer, minimum: 0, description: 当前 SessionParticipant 数量。 }
+        gmt_create: { type: integer, format: int64, description: 创建时间，Unix milliseconds。 }
+        gmt_modified: { type: integer, format: int64, description: 最后修改时间，Unix milliseconds。 }
+        completed_at: { type: integer, format: int64, description: 完成时间；running 时省略。 }
+    Message:
+      type: object
+      required: [message_id, session_id, session_seq, sender_actor_id, content, mentions, metadata, gmt_create]
+      description: Chat Session 中按顺序产生的消息。
+      properties:
+        message_id: { type: string, description: Message 唯一标识。 }
+        session_id: { type: string, description: 所属 Session ID。 }
+        session_seq: { type: integer, minimum: 1, description: Message 在 Session 内的单调递增顺序。 }
+        sender_actor_id: { type: string, description: 发送消息的 SessionParticipant Actor ID。 }
+        content: { type: string, description: 第一版使用的文本消息内容。 }
+        mentions:
+          type: array
+          description: 被显式提及的 SessionParticipant Actor ID；没有 mention 时为空数组。
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 消息级扩展；没有扩展时为空对象。
+        gmt_create: { type: integer, format: int64, description: 创建时间，Unix milliseconds。 }
+
+    InvitationTargetType:
+      type: string
+      enum: [group, session]
+      description: 邀请令牌允许加入的资源类型。
+    Invitation:
+      type: object
+      required: [invite_token, target_type, target_id, expires_at, join_url]
+      description: 具有有效期和目标约束的签名邀请链接。
+      properties:
+        invite_token: { type: string, description: 签名邀请令牌；仅在创建响应中返回。 }
+        target_type: { $ref: "#/components/schemas/InvitationTargetType" }
+        target_id: { type: string, description: 目标 Group 或 Session ID。 }
+        expires_at: { type: integer, format: int64, description: 过期时间，Unix seconds。 }
+        join_url: { type: string, format: uri, description: 可交给 Human 打开的完整加入地址。 }
+    JoinResult:
+      type: object
+      required: [joined, already_member, target_type, target_id, actor_id]
+      description: 使用邀请加入 Group 或 Session 的幂等结果。
+      properties:
+        joined: { type: boolean, description: 本次请求是否新增了 Participant。 }
+        already_member: { type: boolean, description: 请求前是否已经是目标 Participant。 }
+        target_type: { $ref: "#/components/schemas/InvitationTargetType" }
+        target_id: { type: string, description: 已加入或已存在关系的目标资源 ID。 }
+        actor_id: { type: string, description: 当前 Human 对应的 HumanActor ID。 }
+
+    CollaborationTemplate:
+      type: object
+      required: [template_id, name, description, language, tags, definition]
+      description: 创建显式协作 Group 时使用的预置模板。
+      properties:
+        template_id: { type: string, description: 模板唯一标识。 }
+        name: { type: string, description: 模板展示名称。 }
+        description: { type: string, description: 模板适用场景说明。 }
+        language: { type: string, description: 模板内容语言，例如 zh-CN。 }
+        tags:
+          type: array
+          description: 用于筛选和分类的标签。
+          items: { type: string }
+        definition:
+          type: object
+          additionalProperties: true
+          description: 模板携带的 CollaborationDefinition 内容。
+
+    StateMachineRunStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled]
+      description: StateMachineRun 当前状态。
+    StateMachineNodeRun:
+      type: object
+      required: [node_id, status]
+      description: 一次 Run 中单个状态机节点的执行记录。
+      properties:
+        node_id: { type: string, description: 节点 ID。 }
+        status: { $ref: "#/components/schemas/StateMachineRunStatus" }
+        input: { description: 节点输入；尚未执行时可省略。 }
+        output: { description: 节点成功输出；未成功时可省略。 }
+        error_message: { type: string, description: 节点失败信息；未失败时省略。 }
+        started_at: { type: integer, format: int64, description: 开始时间，Unix milliseconds；未开始时省略。 }
+        completed_at: { type: integer, format: int64, description: 完成时间，Unix milliseconds；未结束时省略。 }
+    StateMachineGraphNode:
+      type: object
+      required: [node_id, status]
+      description: 运行图中的节点及其当前进度。
+      properties:
+        node_id: { type: string, description: 节点 ID。 }
+        status: { $ref: "#/components/schemas/StateMachineRunStatus" }
+    StateMachineGraphEdge:
+      type: object
+      required: [from_node_id, to_node_id]
+      description: 状态机运行图中的有向边。
+      properties:
+        from_node_id: { type: string, description: 起点节点 ID。 }
+        to_node_id: { type: string, description: 终点节点 ID。 }
+    StateMachineGraph:
+      type: object
+      required: [run_id, nodes, edges]
+      description: StateMachineRun 的图结构和节点进度。
+      properties:
+        run_id: { type: string, description: Run ID。 }
+        nodes:
+          type: array
+          items: { $ref: "#/components/schemas/StateMachineGraphNode" }
+          description: 图节点和当前状态。
+        edges:
+          type: array
+          items: { $ref: "#/components/schemas/StateMachineGraphEdge" }
+          description: 图的有向边。
+    StateMachineRun:
+      type: object
+      required: [run_id, group_id, status, input, metadata, gmt_create, gmt_modified]
+      description: 基于 Group 当前 CollaborationDefinition 启动的一次独立运行。
+      properties:
+        run_id: { type: string, description: Run 唯一标识。 }
+        group_id: { type: string, description: 启动 Run 的 Group ID。 }
+        status: { $ref: "#/components/schemas/StateMachineRunStatus" }
+        input: { description: 启动 Run 时提交的输入；没有输入时为空对象。 }
+        output: { description: Run 成功完成后的结果；未成功时省略。 }
+        error_message: { type: string, description: Run 失败信息；未失败时省略。 }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 运行级扩展；没有扩展时为空对象。
+        gmt_create: { type: integer, format: int64, description: 创建时间，Unix milliseconds。 }
+        gmt_modified: { type: integer, format: int64, description: 最后修改时间，Unix milliseconds。 }
+        completed_at: { type: integer, format: int64, description: 完成时间；未结束时省略。 }

@@ -1,0 +1,652 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Sessions
+  version: "2026-07-20"
+  description: Session、SessionParticipant、Message 和 Service Invocation。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: sessions
+    description: Session 创建、查询、参与者和生命周期。
+  - name: session-participants
+    description: Session 内实际参与者、角色和 mode。
+  - name: messages
+    description: Chat Session 的消息资源。
+  - name: service-invocations
+    description: 一次调用一个 ServiceInvocation Session。
+
+paths:
+  /openapi/v1/bcn/sessions/{session_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+    get:
+      operationId: getSession
+      tags: [sessions]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份不是 SessionParticipant 且不具备读取权限。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Session 不存在，或调用方无权知道其是否存在。 }
+      summary: 获取 Session 详情
+      description: >
+        返回 Session 元数据和当前 Participant，不内嵌消息历史。GroupManager、直接 GroupParticipant
+        和可代表直接 BotParticipant 的 Human creator 可读取；session-only Actor 只能读取自己参与的 Session。
+        返回结构由 session_kind 决定：chat 不含 invocation，service_invocation 必须包含 invocation。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: ChatSession 或 ServiceInvocationSession。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateSession
+      tags: [sessions]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40002, message: request body is invalid, condition: 更新体为空、字段不合法或没有可更新字段。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份无权修改该 Session。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Session 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40904, message: session state does not allow the operation, condition: Session 当前状态不允许修改。 }
+      summary: 修改 Session 标题
+      description: >
+        第一版只允许修改 session_title，不能修改 kind、status、participants 或 Invocation 结果。
+        仅 GroupManager 或 Session 创建者可以修改；completed Session 返回 409。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 新的 Session 标题。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSessionRequest" }
+      responses:
+        "200":
+          description: 更新后的 Session，具体结构仍由 session_kind 决定。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    delete:
+      operationId: deleteSession
+      tags: [sessions]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份无权删除该 Session。 }
+      summary: 删除 Session
+      description: >
+        仅 GroupManager 或 Session 创建者可以删除 Session 及其从属 Message 和 Participant。
+        删除不影响 GroupParticipant。重复删除按幂等语义返回 deleted=true。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: Session 已删除或此前已经删除。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteSessionResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/sessions/{session_id}/participants:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+    post:
+      operationId: addSessionParticipant
+      tags: [session-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: Actor、角色、mode 或 SessionParticipant 约束不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份无权管理 SessionParticipant。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Session 或目标 Actor 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40902, message: participant already exists, condition: Actor 已经是 SessionParticipant。 }
+      summary: 添加 SessionParticipant
+      description: >
+        仅 GroupManager 或 Session 创建者可以向 running Session 添加 Participant。
+        Bot 必须使用 auto/muted，Human 必须使用 present/absent；actor_kind 与 Actor 实际类型必须一致。
+        添加 SessionParticipant 不会创建 GroupParticipant。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 完整 SessionParticipant，四个字段都必填。
+        content:
+          application/json:
+            schema: { $ref: "../domain-models.yaml#/components/schemas/SessionParticipant" }
+      responses:
+        "201":
+          description: 新增的 BotSessionParticipant 或 HumanSessionParticipant。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/sessions/{session_id}/participants/{actor_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    patch:
+      operationId: updateSessionParticipantMode
+      tags: [session-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: mode 不适用于目标 Actor 类型或不满足 Session 约束。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份既不是目标 Participant，也无权管理该 Session。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Session 或 SessionParticipant 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40904, message: session state does not allow the operation, condition: Session 当前状态不允许修改 Participant mode。 }
+      summary: 修改 SessionParticipant mode
+      description: >
+        只修改当前 Session 中的 mode。GroupManager 或 Session 创建者可以修改任意普通 Participant；
+        Actor 自身及 Bot 的 Human creator 可以修改自己的 mode。Bot 合法值为 auto/muted，Human 为
+        present/absent；不匹配 ActorKind 返回 400。completed Session 返回 409。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 新 mode，服务端结合目标 ActorKind 校验合法组合。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSessionParticipantModeRequest" }
+      responses:
+        "200":
+          description: 更新后的 SessionParticipant，具体结构由 actor_kind 决定。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    delete:
+      operationId: deleteSessionParticipant
+      tags: [session-participants]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40007, message: participant configuration is invalid, condition: actor_id 不是合法 SessionParticipant 标识。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份既不是目标 Participant，也无权管理该 Session。 }
+        "409":
+          - { code: 40903, message: participant cannot be removed, condition: 删除目标会破坏 Session 必需参与者或调用者约束。 }
+      summary: 删除或退出 SessionParticipant
+      description: >
+        GroupManager 或 Session 创建者可移除普通 Participant；Actor 自身及 Bot 的 Human creator
+        可以退出。driver 或运行所需 Participant 不能直接删除。删除不影响 GroupParticipant，重复删除幂等成功。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: Participant 已删除或此前不存在。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeleteSessionParticipantResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/sessions/{session_id}/messages:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+    post:
+      operationId: createSessionMessage
+      tags: [messages]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40010, message: message content is invalid, condition: Message role、parts、metadata 或消息大小不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份不是可发送消息的 SessionParticipant。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Chat Session 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40904, message: session state does not allow the operation, condition: Session 不是 chat 类型或当前状态不允许发送消息。 }
+      summary: 向 Chat Session 发送 Message
+      description: >
+        仅适用于 running ChatSession。content 必填；sender_actor_id 省略时使用调用身份，显式提供时
+        调用方必须能代表该 Actor。发送 Actor 必须是 mode=auto 的 BotParticipant 或 mode=present 的
+        HumanParticipant；mentions 中的 Actor 必须属于同一 Session。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 文本内容、可选发送 Actor、mentions 和扩展元数据。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateMessageRequest" }
+      responses:
+        "201":
+          description: 已持久化并分配 session_seq 的 Message。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    get:
+      operationId: listSessionMessages
+      tags: [messages]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40003, message: pagination parameters are invalid, condition: cursor、limit 或消息查询参数不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40305, message: caller is not allowed to manage the specified session, condition: 调用身份没有读取 Session 消息历史的权限。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Chat Session 不存在，或调用方无权知道其是否存在。 }
+      summary: 查询 Chat Session 消息历史
+      description: >
+        仅适用于 ChatSession，并沿用 Session 可见性授权。消息按 session_seq 升序返回；
+        offset/limit 用于分页，调用方不能通过参数切换成无权代表的 Bot 视角。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 按 session_seq 升序排列的分页 Message。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessagePageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/services/{group_id}/sessions:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    post:
+      operationId: createServiceInvocationSession
+      tags: [service-invocations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40011, message: invocation request is invalid, condition: input、caller_id、meta 或 Service Invocation 参数不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 X-BCS-Service-Key。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Service Key 无效或已经过期。 }
+        "403":
+          - { code: 40308, message: service is not allowed to invoke the specified group, condition: Service Key 未绑定目标 Group。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Service Group 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40908, message: group state does not allow the operation, condition: Group 不是可调用服务，或当前状态不允许创建 Invocation Session。 }
+        "429":
+          - { code: 42902, message: resource quota exceeded, condition: Group 的并发调用数或调用配额已经达到上限。 }
+      summary: 发起 Service Invocation
+      description: >
+        每次调用都创建新的 ServiceInvocationSession，不复用旧 Session。input 必填；external_caller_id
+        仅用于业务归因，不参与鉴权。Service Key 必须绑定目标 Group；Bot/AgentPass 必须满足 Group
+        的调用权限。服务端生成 callerPrincipal 用于后续查询隔离，但不在响应中暴露。
+      security:
+        - serviceKey: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 一次服务调用的输入和可选业务元数据。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateServiceInvocationRequest" }
+      responses:
+        "201":
+          description: 新建且通常为 running 的 ServiceInvocationSession，invocation.output 和 error_message 尚未出现。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunningServiceSessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "429": { $ref: "../_shared.yaml#/components/responses/TooManyRequests" }
+
+  /openapi/v1/bcn/services/{group_id}/sessions/{session_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+      - $ref: "../_shared.yaml#/components/parameters/SessionIdPath"
+    get:
+      operationId: getServiceInvocationSession
+      tags: [service-invocations]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 X-BCS-Service-Key。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Service Key 无效或已经过期。 }
+        "403":
+          - { code: 40308, message: service is not allowed to invoke the specified group, condition: Service Key 未绑定路径中的 Group。 }
+        "404":
+          - { code: 40404, message: session was not found, condition: Group 或 Service Invocation Session 不存在，或对调用方不可见。 }
+      summary: 查询 Service Invocation 状态和结果
+      description: >
+        Session 必须属于路径 Group，且当前凭证生成的 callerPrincipal 必须与创建调用时一致。
+        running 时不返回 output/error_message；completed 成功时返回 output；completed 失败时返回
+        error_message。callback_status 只有配置回调时存在。
+      security:
+        - serviceKey: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: 根据运行结果返回 running、completed success 或 completed failure 三种结构之一。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceSessionResultResponse" }
+              examples:
+                running:
+                  value:
+                    code: 20000
+                    message: OK
+                    data:
+                      session_id: session_001
+                      group_id: group_001
+                      group_version: 1
+                      session_title: ""
+                      session_kind: service_invocation
+                      status: running
+                      participants: []
+                      created_by: service:key_001
+                      gmt_create: 1784512800000
+                      gmt_modified: 1784512800000
+                      invocation: { input: { topic: review } }
+                    request_id: req_service_001
+                succeeded:
+                  value:
+                    code: 20000
+                    message: OK
+                    data:
+                      session_id: session_001
+                      group_id: group_001
+                      group_version: 1
+                      session_title: ""
+                      session_kind: service_invocation
+                      status: completed
+                      participants: []
+                      created_by: service:key_001
+                      gmt_create: 1784512800000
+                      gmt_modified: 1784516400000
+                      completed_at: 1784516400000
+                      invocation: { input: { topic: review }, output: { result: passed } }
+                    request_id: req_service_002
+                failed:
+                  value:
+                    code: 20000
+                    message: OK
+                    data:
+                      session_id: session_001
+                      group_id: group_001
+                      group_version: 1
+                      session_title: ""
+                      session_kind: service_invocation
+                      status: completed
+                      participants: []
+                      created_by: service:key_001
+                      gmt_create: 1784512800000
+                      gmt_modified: 1784516400000
+                      completed_at: 1784516400000
+                      invocation: { input: { topic: review }, error_message: execution failed }
+                    request_id: req_service_003
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    botRuntimeBearer: { $ref: "../_shared.yaml#/components/securitySchemes/botRuntimeBearer" }
+    agentPassBearer: { $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearer" }
+    serviceKey: { $ref: "../_shared.yaml#/components/securitySchemes/serviceKey" }
+  schemas:
+    SessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Session" }
+    UpdateSessionRequest:
+      type: object
+      required: [session_title]
+      additionalProperties: false
+      properties:
+        session_title: { type: string, description: 新标题；允许空字符串清空标题。 }
+    DeleteSessionData:
+      type: object
+      required: [session_id, deleted]
+      properties:
+        session_id: { type: string, description: 被删除的 Session ID。 }
+        deleted: { type: boolean, const: true, description: 删除和幂等重试固定为 true。 }
+    DeleteSessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/DeleteSessionData" }
+    SessionParticipantResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/SessionParticipant" }
+    UpdateSessionParticipantModeRequest:
+      oneOf:
+        - type: object
+          required: [mode]
+          additionalProperties: false
+          properties:
+            mode: { $ref: "../domain-models.yaml#/components/schemas/BotParticipantMode" }
+        - type: object
+          required: [mode]
+          additionalProperties: false
+          properties:
+            mode: { $ref: "../domain-models.yaml#/components/schemas/HumanParticipantMode" }
+      description: 目标 ActorKind 决定使用 Bot 或 Human mode 分支。
+    DeleteSessionParticipantData:
+      type: object
+      required: [session_id, actor_id, deleted]
+      properties:
+        session_id: { type: string, description: Session ID。 }
+        actor_id: { type: string, description: 被删除关系的 Actor ID。 }
+        deleted: { type: boolean, const: true, description: 删除和幂等重试固定为 true。 }
+    DeleteSessionParticipantResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/DeleteSessionParticipantData" }
+    CreateMessageRequest:
+      type: object
+      required: [content]
+      additionalProperties: false
+      properties:
+        content: { type: string, minLength: 1, description: 文本消息内容。 }
+        sender_actor_id: { type: string, description: 发送 Actor；省略时使用当前调用身份。 }
+        mentions:
+          type: array
+          uniqueItems: true
+          description: 被提及的 SessionParticipant Actor ID；省略时为空数组。
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 消息级扩展；省略时为空对象。
+    MessageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Message" }
+    MessagePageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [session_id, items]
+          properties:
+            session_id: { type: string, description: 被查询的 Session ID。 }
+            items:
+              type: array
+              items: { $ref: "../domain-models.yaml#/components/schemas/Message" }
+              description: 当前页消息，按 session_seq 升序。
+    MessagePageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/MessagePageData" }
+    CreateServiceInvocationRequest:
+      type: object
+      required: [input]
+      additionalProperties: false
+      properties:
+        input: { description: 本次服务调用的结构化输入，可以是任意 JSON 值。 }
+        session_title: { type: string, description: 可选 Session 标题；省略时为空字符串或服务端生成。 }
+        external_caller_id: { type: string, description: 可选业务归因标识，不参与鉴权。 }
+        metadata: { type: object, additionalProperties: true, description: 可选调用级扩展。 }
+    RunningInvocation:
+      type: object
+      required: [input]
+      not:
+        anyOf:
+          - required: [output]
+          - required: [error_message]
+      properties:
+        input: { description: 调用输入。 }
+        external_caller_id: { type: string, description: 调用方业务标识；未提供时省略。 }
+        callback_status: { type: string, const: pending, description: 已配置回调且待执行时为 pending；未配置时省略。 }
+        metadata: { type: object, additionalProperties: true, description: 调用扩展；未提供时省略。 }
+    SucceededInvocation:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/Invocation"
+        - type: object
+          required: [input, output]
+          not:
+            required: [error_message]
+    FailedInvocation:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/Invocation"
+        - type: object
+          required: [input, error_message]
+          not:
+            required: [output]
+    RunningServiceSession:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/ServiceInvocationSession"
+        - type: object
+          required: [status, invocation]
+          properties:
+            status: { type: string, const: running, description: 固定为 running。 }
+            invocation: { $ref: "#/components/schemas/RunningInvocation" }
+    SucceededServiceSession:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/ServiceInvocationSession"
+        - type: object
+          required: [status, completed_at, invocation]
+          properties:
+            status: { type: string, const: completed, description: 固定为 completed。 }
+            invocation: { $ref: "#/components/schemas/SucceededInvocation" }
+    FailedServiceSession:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/ServiceInvocationSession"
+        - type: object
+          required: [status, completed_at, invocation]
+          properties:
+            status: { type: string, const: completed, description: 固定为 completed。 }
+            invocation: { $ref: "#/components/schemas/FailedInvocation" }
+    RunningServiceSessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/RunningServiceSession" }
+    ServiceSessionResult:
+      oneOf:
+        - $ref: "#/components/schemas/RunningServiceSession"
+        - $ref: "#/components/schemas/SucceededServiceSession"
+        - $ref: "#/components/schemas/FailedServiceSession"
+    ServiceSessionResultResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ServiceSessionResult" }

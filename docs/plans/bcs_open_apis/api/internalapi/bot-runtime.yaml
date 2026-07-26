@@ -1,0 +1,415 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - Bot Runtime
+  version: "2026-07-06"
+  description: >
+    BCN/BCS Bot Runtime、Bot 内部生命周期和 Bot A2A 内部接口。REST JSON 响应统一使用 `Envelope`；
+    WebSocket 帧不使用 REST envelope，但错误载荷复用 `code` 与 `message`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: bot-runtime
+    description: Bot Runtime WebSocket。
+  - name: bot-lifecycle-internal
+    description: Bot 内部生命周期。
+  - name: bot-a2a-internal
+    description: 单 Bot 异步调用 / Bot A2A。
+
+paths:
+  /api/bcn/v1/ws/bot:
+    get:
+      operationId: connectBotRuntimeWebSocket
+      tags: [bot-runtime]
+      summary: 建立 Bot Runtime WebSocket
+      description: >
+        作用：Bot Runtime 长连接入口，用于 Bot 注册、恢复连接、接收 `chat.send`/`chat.inject`
+        等运行时消息。连接建立后通过 `bot.connect` 帧完成注册或恢复。
+
+        鉴权：Upgrade 前 query token 为空允许新 Bot 首次连接；有效 agent token 恢复连接；
+        无效 token 拒绝。
+      security:
+        - agentBearerAuth: []
+        - {}
+      parameters:
+        - { name: token, in: query, required: false, schema: { type: string } }
+      responses:
+        "101":
+          description: WebSocket upgrade accepted.
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/bots/discover:
+    get:
+      operationId: discoverInternalBots
+      tags: [bot-lifecycle-internal]
+      summary: 内部 Bot 发现
+      description: >
+        按当前实现支持的发现条件搜索可协作 Bot。`q`、`name`、`skills`、`domains`、`scopes`
+        是优先级选择关系，优先级为 `q > name > skills > domains > scopes`；
+        `visibility` 和 `collaborate_bot` 是额外过滤条件。
+
+        鉴权：当前实现为 public，无身份校验；该接口为内部发现能力，外部目录查询应优先使用
+        OpenAPI Bot/Actor 目录。
+      security: []
+      parameters:
+        - { name: q, in: query, required: false, schema: { type: string }, description: 综合搜索 name、summary、dynamic_summary、domains、skills 等。 }
+        - { name: name, in: query, required: false, schema: { type: string }, description: 按 Bot 名称模糊搜索。 }
+        - { name: skills, in: query, required: false, schema: { type: string }, description: 逗号分隔，要求全部技能匹配。 }
+        - { name: domains, in: query, required: false, schema: { type: string }, description: 逗号分隔，要求全部领域匹配。 }
+        - { name: scopes, in: query, required: false, schema: { type: string }, description: 逗号分隔，要求全部 scope 匹配。 }
+        - { name: visibility, in: query, required: false, schema: { $ref: "../_shared.yaml#/components/schemas/BotVisibility" }, description: 可见性过滤，通常使用 public 或 protected。 }
+        - { name: collaborate_bot, in: query, required: false, schema: { type: string }, description: 以该 Bot UUID 的协作资格过滤结果，返回 public + friends，并输出 is_friend。 }
+      responses:
+        "200":
+          description: 可协作 Bot 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiscoverBotsResponse" }
+              example:
+                code: 200000
+                message: OK
+                data:
+                  bots:
+                    - bot_uuid: bot-alpha
+                      capabilities:
+                        name: Bot Alpha
+                        summary: Bot summary
+                        domains: [code]
+                        skills:
+                          - { name: review, description: Review code }
+                        scopes: [repo:read]
+                        visibility: public
+                      visibility: public
+                      is_friend: false
+                      agent_code: agent-code
+                      provider_info:
+                        provider_id: provider-1
+                        provider_name: Provider
+                  count: 1
+                request_id: req-discover-001
+
+  /api/bcn/v1/admin/bots/onboard:
+    post:
+      operationId: adminOnboardBot
+      tags: [bot-lifecycle-internal]
+      summary: Admin/Workbench 代理 Bot 入网
+      description: >
+        作用：Workbench/Admin 或 backend 代理创建或更新 Bot 入网信息，用于前端入网按钮和 backend Bot
+        创建/更新后的 BCN 同步。`binding_channels` 不进入目标 request schema。
+
+        鉴权：目标态使用 human cookie 或 OAuth session cookie 识别操作人；当前实现对 admin token 要求较弱，
+        后续可按管理侧权限收紧。
+      security:
+        - humanCookie: []
+        - oauthSessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AdminOnboardBotRequest" }
+      responses:
+        "200":
+          description: Bot 入网结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OnboardBotResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /api/bcn/v1/bots/{bot_uuid}/chat-async:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    post:
+      operationId: createBotChatRun
+      tags: [bot-a2a-internal]
+      summary: 提交单 Bot 异步调用
+      description: >
+        作用：创建一次面向单个 Bot 的异步 invocation run，替代 legacy blocking `/bots/{id}/chat`。
+        bcs-cli chat 当前走该接口并通过 run 查询获取结果。
+
+        鉴权：要求 agent bearer token 或 AgentPass token；service 记录 caller 并校验 run 归属。
+      security:
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateChatRunRequest" }
+      responses:
+        "202":
+          description: Chat run 已创建。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatRunResponse" }
+              example:
+                code: 202101
+                message: chat run accepted
+                data: { run_id: run_abc, bot_uuid: bot_abc, session_id: session_abc, status: queued }
+                request_id: req-chat-run-001
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+        "503": { $ref: "../_shared.yaml#/components/responses/ServiceUnavailable" }
+
+  /api/bcn/v1/chat/runs/{run_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+    get:
+      operationId: getBotChatRun
+      tags: [bot-a2a-internal]
+      summary: 查询异步调用结果
+      description: >
+        作用：查询单 Bot invocation run 的状态、结果和错误；支持 `wait_ms` 做短轮询。
+
+        鉴权：要求 agent bearer token 或 AgentPass token；service 校验 run 归属后返回。
+      security:
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      parameters:
+        - { name: wait_ms, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 30000 } }
+      responses:
+        "200":
+          description: Chat run 状态和结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatRunResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/chat/runs/{run_id}/cancel:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+    post:
+      operationId: cancelBotChatRun
+      tags: [bot-a2a-internal]
+      summary: 取消异步调用
+      description: >
+        作用：取消正在运行或排队中的单 Bot invocation run。
+
+        鉴权：要求 agent bearer token 或 AgentPass token；service 校验 run 归属后取消。
+      security:
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      responses:
+        "200":
+          description: 取消后的 run 状态。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatRunResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    oauthSessionCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/oauthSessionCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+
+  schemas:
+    BotRuntimeRequestFrame:
+      oneOf:
+        - $ref: "#/components/schemas/BotConnectFrame"
+        - $ref: "#/components/schemas/BotStatusFrame"
+        - $ref: "#/components/schemas/TaskDispatchFrame"
+        - $ref: "#/components/schemas/TaskMessageFrame"
+        - $ref: "#/components/schemas/RouteResolveFrame"
+        - $ref: "#/components/schemas/TaskCompleteFrame"
+        - $ref: "#/components/schemas/SessionCompleteFrame"
+
+    BotConnectFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [bot.connect] }
+        params:
+          type: object
+          properties:
+            token: { type: string, nullable: true }
+            capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+
+    BotStatusFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [bot.status] }
+        params:
+          type: object
+          required: [status]
+          properties:
+            status: { type: string, enum: [active, offline] }
+
+    TaskDispatchFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [task.dispatch] }
+        params: { type: object, additionalProperties: true }
+
+    TaskMessageFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [task.message] }
+        params: { type: object, additionalProperties: true }
+
+    RouteResolveFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [route.resolve] }
+        params: { type: object, additionalProperties: true }
+
+    TaskCompleteFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [task.complete] }
+        params: { type: object, additionalProperties: true }
+
+    SessionCompleteFrame:
+      type: object
+      required: [type, id, method, params]
+      properties:
+        type: { type: string, enum: [req] }
+        id: { type: string }
+        method: { type: string, enum: [session.complete] }
+        params: { type: object, additionalProperties: true }
+
+    BotListData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "../_shared.yaml#/components/schemas/Bot" }
+
+    BotListResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/BotListData" } }
+
+    DiscoverBotProviderInfo:
+      type: object
+      required: [provider_id, provider_name]
+      properties:
+        provider_id: { type: string }
+        provider_name: { type: string }
+
+    DiscoverBot:
+      type: object
+      required: [bot_uuid, capabilities, visibility]
+      properties:
+        bot_uuid: { type: string }
+        capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+        visibility: { $ref: "../_shared.yaml#/components/schemas/BotVisibility" }
+        is_friend:
+          type: boolean
+          nullable: true
+          description: Only returned when `collaborate_bot` is provided.
+        agent_code:
+          type: string
+          nullable: true
+        provider_info:
+          allOf:
+            - $ref: "#/components/schemas/DiscoverBotProviderInfo"
+          nullable: true
+
+    DiscoverBotsData:
+      type: object
+      required: [bots, count]
+      properties:
+        bots:
+          type: array
+          items: { $ref: "#/components/schemas/DiscoverBot" }
+        count: { type: integer, minimum: 0 }
+
+    DiscoverBotsResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/DiscoverBotsData" } }
+
+    OnboardBotRequest:
+      type: object
+      required: [capabilities]
+      properties:
+        bot_uuid: { type: string, nullable: true }
+        capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+
+    AdminOnboardBotRequest:
+      allOf:
+        - $ref: "#/components/schemas/OnboardBotRequest"
+
+    OnboardBotData:
+      type: object
+      required: [bot_uuid]
+      properties:
+        bot_uuid: { type: string }
+        token: { type: string, nullable: true }
+        capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+
+    OnboardBotResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/OnboardBotData" } }
+
+    CreateChatRunRequest:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string }
+        session_id: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+
+    ChatRun:
+      type: object
+      required: [run_id, status]
+      properties:
+        run_id: { type: string }
+        bot_uuid: { type: string, nullable: true }
+        session_id: { type: string, nullable: true }
+        status: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        result: { nullable: true }
+        error: { type: object, nullable: true, additionalProperties: true }
+        expires_at_ms: { type: integer, nullable: true }
+
+    ChatRunResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ChatRun" } }

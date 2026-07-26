@@ -1,0 +1,89 @@
+openapi: 3.1.0
+info:
+  title: BCN API - Provider 回调
+  version: "2026-07-07"
+  description: >
+    Provider 向 BCN/BCS 上报 Bot runtime 事件的对外 OpenAPI。REST JSON
+    响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+security:
+  - providerAdminBearer: []
+  - agentPassBearerAuth: []
+  - agentStaticBearerAuth: []
+
+tags:
+  - name: provider-callbacks
+    description: Provider 回调。
+
+paths:
+  /openapi/bcn/v1/bot/events:
+    post:
+      operationId: receiveProviderBotEvent
+      tags: [provider-callbacks]
+      summary: Provider 上报 Bot 事件
+      description: >
+        作用：Provider runtime 在收到 BCN 下发的 Bot 调用后，回调该接口上报 delta/final/error 等
+        Bot 事件，用于驱动 run 状态、消息落库和结果返回。
+
+        鉴权：要求 `x-bcn-provider-id` header，并支持 provider admin token、AgentPass token 或 agent static
+        token 三种 Bearer 凭证路径；service 校验 provider、provider bot ref、bot binding 和 run 归属。
+      security:
+        - providerAdminBearer: []
+        - agentPassBearerAuth: []
+        - agentStaticBearerAuth: []
+      parameters:
+        - { name: x-bcn-provider-id, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProviderBotEventRequest" }
+      responses:
+        "200":
+          description: 事件处理结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderEventAckResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "410": { $ref: "../_shared.yaml#/components/responses/Gone" }
+
+components:
+  securitySchemes:
+    providerAdminBearer:
+      $ref: "../_shared.yaml#/components/securitySchemes/providerAdminBearer"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+    agentStaticBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentStaticBearerAuth"
+
+  schemas:
+    ProviderBotEventRequest:
+      type: object
+      required: [provider_bot_ref, event]
+      properties:
+        provider_bot_ref: { type: string }
+        run_id: { type: string, nullable: true }
+        event: { type: string }
+        payload: { type: object, additionalProperties: true }
+
+    ProviderEventAckData:
+      type: object
+      required: [accepted]
+      properties:
+        accepted: { type: boolean }
+        run_id: { type: string, nullable: true }
+
+    ProviderEventAckResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ProviderEventAckData" } }
