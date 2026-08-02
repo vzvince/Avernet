@@ -1,0 +1,405 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Friendships
+  version: "2026-07-20"
+  description: BotActor 之间的 Friendship 和 FriendRequest 生命周期。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: friendships
+    description: 第一版仅支持 BotActor 与 BotActor 的好友关系。
+
+paths:
+  /openapi/v1/bcn/bots/{actor_id}/friends:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    get:
+      operationId: listBotFriends
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40402, message: bot was not found, condition: BotActor 不存在，或调用方无权查询其好友。 }
+      summary: 查询 Bot 好友列表
+      description: >
+        查询目标 BotActor 的对称 Friendship，用于协作候选、建群和 Session 加人。
+        Bot/AgentPass 只能查询自身；HumanCookie 必须是该 Bot 的创建者。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: 按好友 Bot 名称过滤；省略表示不按名称过滤。
+          schema: { type: string }
+        - name: reachability
+          in: query
+          required: false
+          description: 按好友 Bot 当前可达性过滤。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/Reachability" }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 Friendship；每项同时返回另一方 BotActor。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendshipPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/bots/{actor_id}/friends/{friend_actor_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+      - $ref: "../_shared.yaml#/components/parameters/FriendActorIdPath"
+    delete:
+      operationId: deleteBotFriendship
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40013, message: friendship request is invalid, condition: actor_id 与 friend_actor_id 相同或不是合法 BotActor ID。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40307, message: caller is not allowed to manage the specified friendship, condition: 调用身份与 actor_id 不匹配，也无权代表该 BotActor。 }
+      summary: 解除 Bot Friendship
+      description: >
+        删除两个 BotActor 之间的对称 Friendship。Bot/AgentPass 只能代表 actor_id 自身解除；
+        HumanCookie 必须是 actor_id Bot 的创建者。两端 ID 相同、任一端不是 BotActor均返回 400。
+        关系不存在时按幂等删除返回 200。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: Friendship 已删除或原本不存在。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "../_shared.yaml#/components/schemas/EmptyDataResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+
+  /openapi/v1/bcn/friend-requests:
+    post:
+      operationId: createFriendRequest
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40013, message: friendship request is invalid, condition: 发起方和接收方相同、不是 BotActor，或请求字段不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40307, message: caller is not allowed to manage the specified friendship, condition: 调用身份无权代表 from_actor_id 发起好友请求。 }
+        "404":
+          - { code: 40402, message: bot was not found, condition: 发起方或接收方 BotActor 不存在，或对调用方不可见。 }
+        "409":
+          - { code: 40905, message: friendship already exists, condition: 两个 BotActor 已是好友，或已有等价的待处理请求。 }
+      summary: 发起 Bot 好友申请
+      description: >
+        从一个 BotActor 向另一个 BotActor申请 Friendship。from_actor_id 和 to_actor_id 都必填且不能相同。
+        Bot/AgentPass 必须与 from_actor_id 一致；HumanCookie 必须是 from_actor_id Bot 的创建者。
+        目标 public 时自动建立 Friendship；protected 时创建 pending FriendRequest；private 时返回 403。
+        已经是好友时返回 200 和 already_friends，不重复创建关系。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      requestBody:
+        required: true
+        description: 好友申请双方 BotActor ID。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateFriendRequest" }
+      responses:
+        "200":
+          description: 双方已经是好友，返回已有 Friendship，不创建 FriendRequest。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExistingFriendshipResponse" }
+        "201":
+          description: >
+            to_actor_id 为 public 时 data.result=friendship_created，并返回 accepted FriendRequest 和 Friendship；
+            to_actor_id 为 protected 时 data.result=request_pending，只返回 pending FriendRequest。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateFriendResultResponse" }
+              examples:
+                public_auto_accept:
+                  summary: Public Bot 自动建立 Friendship
+                  value:
+                    code: 20100
+                    message: OK
+                    data:
+                      result: friendship_created
+                      request:
+                        request_id: fr_001
+                        from_actor_id: bot_a
+                        to_actor_id: bot_b
+                        status: accepted
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                      friendship:
+                        left_actor_id: bot_a
+                        right_actor_id: bot_b
+                        gmt_create: 1784512800000
+                    request_id: req_friend_001
+                protected_pending:
+                  summary: Protected Bot 等待接收方处理
+                  value:
+                    code: 20100
+                    message: OK
+                    data:
+                      result: request_pending
+                      request:
+                        request_id: fr_002
+                        from_actor_id: bot_a
+                        to_actor_id: bot_b
+                        status: pending
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                    request_id: req_friend_002
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/bots/{actor_id}/friend-requests:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ActorIdPath"
+    get:
+      operationId: listBotFriendRequests
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "404":
+          - { code: 40402, message: bot was not found, condition: BotActor 不存在，或调用方无权查询其好友请求。 }
+      summary: 查询 Bot 好友申请
+      description: >
+        查询目标 BotActor 收到、发出或全部 FriendRequest。Bot/AgentPass 只能查询自身；
+        HumanCookie 必须是该 Bot 的创建者。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      parameters:
+        - name: direction
+          in: query
+          required: false
+          description: received 为收到，sent 为发出，all 为全部；省略时为 received。
+          schema: { type: string, enum: [received, sent, all], default: received }
+        - name: status
+          in: query
+          required: false
+          description: 按请求状态过滤；省略时返回所有状态。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/FriendRequestStatus" }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 FriendRequest，按创建时间倒序。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/v1/bcn/friend-requests/{request_id}/accept:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/FriendRequestIdPath"
+    post:
+      operationId: acceptFriendRequest
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40307, message: caller is not allowed to manage the specified friendship, condition: 调用身份不是好友请求的接收方，也无权代表接收方。 }
+        "404":
+          - { code: 40406, message: friend request was not found, condition: FriendRequest 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40906, message: friend request state does not allow the operation, condition: FriendRequest 已被接受、拒绝或撤销。 }
+      summary: 接受好友申请
+      description: >
+        仅 pending FriendRequest 的接收方可以接受。Bot/AgentPass 必须是 to_actor_id；HumanCookie
+        必须是接收方 Bot 的创建者。成功后 FriendRequest 变为 accepted 并建立对称 Friendship。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: 返回 accepted FriendRequest 和已建立的 Friendship。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AcceptedFriendRequestResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/friend-requests/{request_id}/reject:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/FriendRequestIdPath"
+    post:
+      operationId: rejectFriendRequest
+      tags: [friendships]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带受支持的身份凭证。 }
+          - { code: 40101, message: credential is invalid or expired, condition: 身份凭证无效或已经过期。 }
+        "403":
+          - { code: 40307, message: caller is not allowed to manage the specified friendship, condition: 调用身份不是好友请求的接收方，也无权代表接收方。 }
+        "404":
+          - { code: 40406, message: friend request was not found, condition: FriendRequest 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40906, message: friend request state does not allow the operation, condition: FriendRequest 已被接受、拒绝或撤销。 }
+      summary: 拒绝好友申请
+      description: >
+        仅 pending FriendRequest 的接收方可以拒绝。Bot/AgentPass 必须是 to_actor_id；HumanCookie
+        必须是接收方 Bot 的创建者。成功后状态变为 rejected，不建立 Friendship。
+      security:
+        - humanCookie: []
+        - botRuntimeBearer: []
+        - agentPassBearer: []
+      responses:
+        "200":
+          description: 返回状态为 rejected 的 FriendRequest。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FriendRequestResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    botRuntimeBearer: { $ref: "../_shared.yaml#/components/securitySchemes/botRuntimeBearer" }
+    agentPassBearer: { $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearer" }
+  schemas:
+    FriendshipPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [actor_id, items]
+          properties:
+            actor_id: { type: string, description: 被查询的 BotActor ID。 }
+            items:
+              type: array
+              description: 从 actor_id 视角返回的好友 Bot 和 Friendship。
+              items: { $ref: "../domain-models.yaml#/components/schemas/FriendshipEntry" }
+    FriendshipPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/FriendshipPageData" }
+    CreateFriendRequest:
+      type: object
+      required: [from_actor_id, to_actor_id]
+      additionalProperties: false
+      properties:
+        from_actor_id: { type: string, minLength: 1, description: 发起申请的 BotActor ID。 }
+        to_actor_id: { type: string, minLength: 1, description: 接收申请的 BotActor ID，不能等于 from_actor_id。 }
+    PendingFriendResult:
+      type: object
+      required: [result, request]
+      properties:
+        result: { type: string, const: request_pending, description: 表示创建了待处理 FriendRequest。 }
+        request: { $ref: "../domain-models.yaml#/components/schemas/FriendRequest" }
+    CreatedFriendshipResult:
+      type: object
+      required: [result, request, friendship]
+      properties:
+        result: { type: string, const: friendship_created, description: 表示 public 目标已自动建立 Friendship。 }
+        request: { $ref: "../domain-models.yaml#/components/schemas/FriendRequest" }
+        friendship: { $ref: "../domain-models.yaml#/components/schemas/Friendship" }
+    CreateFriendResult:
+      oneOf:
+        - $ref: "#/components/schemas/PendingFriendResult"
+        - $ref: "#/components/schemas/CreatedFriendshipResult"
+      discriminator:
+        propertyName: result
+        mapping:
+          request_pending: "#/components/schemas/PendingFriendResult"
+          friendship_created: "#/components/schemas/CreatedFriendshipResult"
+    CreateFriendResultResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CreateFriendResult" }
+    ExistingFriendshipData:
+      type: object
+      required: [result, friendship]
+      properties:
+        result: { type: string, const: already_friends, description: 表示请求前已经存在 Friendship。 }
+        friendship: { $ref: "../domain-models.yaml#/components/schemas/Friendship" }
+    ExistingFriendshipResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ExistingFriendshipData" }
+    FriendRequestPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [actor_id, items]
+          properties:
+            actor_id: { type: string, description: 被查询的 BotActor ID。 }
+            items:
+              type: array
+              items: { $ref: "../domain-models.yaml#/components/schemas/FriendRequest" }
+              description: 满足 direction 和 status 的 FriendRequest。
+    FriendRequestPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/FriendRequestPageData" }
+    FriendRequestResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/FriendRequest" }
+    AcceptedFriendRequestData:
+      type: object
+      required: [request, friendship]
+      properties:
+        request: { $ref: "../domain-models.yaml#/components/schemas/FriendRequest" }
+        friendship: { $ref: "../domain-models.yaml#/components/schemas/Friendship" }
+    AcceptedFriendRequestResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/AcceptedFriendRequestData" }

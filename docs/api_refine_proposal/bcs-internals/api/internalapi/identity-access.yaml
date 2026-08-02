@@ -1,0 +1,209 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - 身份与接入
+  version: "2026-07-06"
+  description: >
+    BCN/BCS 身份与接入内部接口，包括 Workbench 当前用户、human actor 修复和人工注册流程。
+    REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: identity-access
+    description: 身份与接入。
+
+paths:
+  /api/bcn/v1/me:
+    get:
+      operationId: getCurrentBcnUser
+      tags: [identity-access]
+      summary: 当前用户身份
+      description: >
+        作用：读取当前 Workbench 请求中的人身份信息，并映射到 BCN human actor。
+
+        鉴权：支持 human cookie 或 OAuth session cookie；未登录时允许匿名返回空身份字段。
+      security:
+        - humanCookie: []
+        - oauthSessionCookie: []
+        - {}
+      responses:
+        "200":
+          description: 当前用户信息；未登录时字段可为空。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MeResponse" }
+
+  /api/bcn/v1/me/repair-info:
+    get:
+      operationId: getHumanRepairInfo
+      tags: [identity-access]
+      summary: 身份修复信息
+      description: >
+        作用：查询或生成 human actor 修复所需信息，用于修复 staff_no/nick_name 与 BCN actor 的绑定。
+
+        鉴权：支持 human cookie 或 OAuth session cookie；当前也允许匿名/显式 query 参数用于修复场景。
+      security:
+        - humanCookie: []
+        - oauthSessionCookie: []
+        - {}
+      parameters:
+        - { name: staff_no, in: query, required: false, schema: { type: string } }
+        - { name: nick_name, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: 身份修复信息。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RepairInfoResponse" }
+
+  /api/bcn/v1/me/ensure-human:
+    post:
+      operationId: ensureHumanActor
+      tags: [identity-access]
+      summary: 确保人类 Actor 存在
+      description: >
+        作用：确保当前登录人对应的 `human_{staff_no}` actor 已存在，并返回 actor 信息。
+
+        鉴权：要求 human cookie 或 OAuth session cookie；无有效人身份返回 401。
+      security:
+        - humanCookie: []
+        - oauthSessionCookie: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnsureHumanRequest" }
+      responses:
+        "200":
+          description: Human actor 信息。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActorResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/register/token:
+    get:
+      operationId: getManualRegisterToken
+      tags: [identity-access]
+      summary: 获取人工注册 token
+      description: >
+        作用：为当前登录人生成人工注册 Bot 的 signed token。
+
+        鉴权：要求 human cookie；token 后续用于 `/register` 完成人工注册。
+      security:
+        - humanCookie: []
+      responses:
+        "200":
+          description: 人工注册 token。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RegisterTokenResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+
+  /api/bcn/v1/register:
+    post:
+      operationId: registerManualBot
+      tags: [identity-access]
+      summary: 人工注册 Bot
+      description: >
+        作用：使用人工注册 signed token 提交 Bot capabilities 并注册 Bot。
+
+        鉴权：要求 query 中的 signed token；service 校验 token 签名、过期时间和资源绑定。
+      security:
+        - signedToken: []
+      parameters:
+        - { name: token, in: query, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterBotRequest" }
+      responses:
+        "201":
+          description: 注册后的 Bot。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RegisterBotResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    oauthSessionCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/oauthSessionCookie"
+    signedToken:
+      $ref: "../_shared.yaml#/components/securitySchemes/signedToken"
+
+  schemas:
+    MeData:
+      type: object
+      properties:
+        staff_no: { type: string, nullable: true }
+        nick_name: { type: string, nullable: true }
+        actor_uuid: { type: string, nullable: true }
+
+    MeResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/MeData" } }
+
+    RepairInfoData:
+      type: object
+      additionalProperties: true
+
+    RepairInfoResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/RepairInfoData" } }
+
+    EnsureHumanRequest:
+      type: object
+      properties:
+        staff_no: { type: string }
+        nick_name: { type: string }
+
+    ActorResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Actor" } }
+
+    RegisterTokenData:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time, nullable: true }
+
+    RegisterTokenResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/RegisterTokenData" } }
+
+    RegisterBotRequest:
+      type: object
+      required: [bot_name]
+      properties:
+        bot_name: { type: string }
+        capabilities: { $ref: "../_shared.yaml#/components/schemas/BotCapabilities" }
+
+    RegisterBotResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Bot" } }

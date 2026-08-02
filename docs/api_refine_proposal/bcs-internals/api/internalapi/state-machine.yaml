@@ -1,0 +1,193 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - 状态机运行
+  version: "2026-07-06"
+  description: >
+    BCN/BCS 状态机运行内部接口。REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: state-machine-runs
+    description: 状态机运行。
+
+paths:
+  /api/bcn/v1/groups/{group_id}/state-machine-runs:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    post:
+      operationId: startStateMachineRun
+      tags: [state-machine-runs]
+      summary: 启动状态机运行
+      description: >
+        作用：基于群组状态机定义启动一次 run，用于内部状态机调试、集成测试或 Provider downlink 联调。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API，外部应优先使用协作任务查询接口观察过程状态。
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartStateMachineRunRequest" }
+      responses:
+        "202":
+          description: 状态机 run 已启动。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineRunResponse" }
+              example:
+                code: 202501
+                message: state machine run accepted
+                data: { run_id: run_abc, group_id: group_abc, status: running }
+                request_id: req-sm-001
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /api/bcn/v1/state-machine-runs/{run_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+    get:
+      operationId: getStateMachineRun
+      tags: [state-machine-runs]
+      summary: 获取状态机运行
+      description: >
+        作用：查询状态机 run 的基本状态、结果和时间信息。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API。
+      security: []
+      responses:
+        "200":
+          description: 状态机 run。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineRunResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/state-machine-runs/{run_id}/graph:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+    get:
+      operationId: getStateMachineRunGraph
+      tags: [state-machine-runs]
+      summary: 获取状态机运行图
+      description: >
+        作用：查询状态机 run 的图结构、节点状态和执行进度，用于内部观测和排查。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API。
+      security: []
+      responses:
+        "200":
+          description: 状态机运行图。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineGraphResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/state-machine-runs/{run_id}/nodes/{node_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+      - { $ref: "../_shared.yaml#/components/parameters/NodeIdPath" }
+    get:
+      operationId: getStateMachineNodeRun
+      tags: [state-machine-runs]
+      summary: 获取节点运行详情
+      description: >
+        作用：查询状态机单个节点的输入、输出和执行状态，用于定位节点级问题。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API。
+      security: []
+      responses:
+        "200":
+          description: 节点运行详情。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineNodeResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/state-machine-runs/{run_id}/cancel:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/RunIdPath" }
+    post:
+      operationId: cancelStateMachineRun
+      tags: [state-machine-runs]
+      summary: 取消状态机运行
+      description: >
+        作用：取消正在运行的 state_machine run，用于内部调试或运维终止。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API。
+      security: []
+      responses:
+        "200":
+          description: 取消后的状态机 run。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineRunResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  schemas:
+    StartStateMachineRunRequest:
+      type: object
+      properties:
+        input: { type: object, additionalProperties: true }
+        metadata: { type: object, additionalProperties: true }
+
+    StateMachineRun:
+      type: object
+      required: [run_id, status]
+      properties:
+        run_id: { type: string }
+        group_id: { type: string, nullable: true }
+        status: { type: string }
+        started_at: { type: string, format: date-time, nullable: true }
+        completed_at: { type: string, format: date-time, nullable: true }
+        result: { nullable: true }
+
+    StateMachineRunResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/StateMachineRun" } }
+
+    StateMachineGraph:
+      type: object
+      properties:
+        run_id: { type: string }
+        nodes:
+          type: array
+          items: { type: object, additionalProperties: true }
+        edges:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    StateMachineGraphResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/StateMachineGraph" } }
+
+    StateMachineNode:
+      type: object
+      required: [node_id]
+      properties:
+        node_id: { type: string }
+        status: { type: string, nullable: true }
+        input: { nullable: true }
+        output: { nullable: true }
+        error: { nullable: true }
+
+    StateMachineNodeResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/StateMachineNode" } }

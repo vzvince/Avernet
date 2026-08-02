@@ -1,0 +1,282 @@
+openapi: 3.1.0
+info:
+  title: BCN Shared API Components
+  version: "2026-07-20"
+  description: BCN 目标 API 共用的协议、鉴权、参数、响应和错误组件。
+paths: {}
+
+components:
+  securitySchemes:
+    humanCookie:
+      type: apiKey
+      in: cookie
+      name: IAM_TOKEN
+      description: 登录人的 SSO Cookie。服务端解析 staff_no，并映射为 human_{staff_no}。
+    botRuntimeBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: BCN Bot Runtime Token
+      description: Bot 直连 BCN 使用的 Runtime Token，必须解析为唯一 BotActor。
+    agentPassBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: AgentPass JWT
+      description: AgentPass 身份凭证，服务端必须将其解析为唯一 BotActor。
+    providerAdminBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: BCN Provider Admin Token
+      description: Provider 管理凭证，只能访问和修改 token 绑定的 Provider。
+    registrationBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: BCN Bot Registration Token
+      description: Human 签发的短期 Bot 注册凭证，只能用于个人 Bot 注册。
+    serviceKey:
+      type: apiKey
+      in: header
+      name: X-BCS-Service-Key
+      description: Service Invocation 凭证，必须绑定一个或多个允许调用的 Group。
+    internalServiceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: BCN Internal Service Token
+      description: 受信任的内部服务或运维身份，不向普通 Human 或 Bot 签发。
+
+  headers:
+    XTraceId:
+      description: 请求追踪 ID，与响应体 request_id 一致。
+      schema:
+        type: string
+
+  parameters:
+    ActorIdPath:
+      name: actor_id
+      in: path
+      required: true
+      description: BCN Actor 唯一标识，例如 human_123456 或 bot_reviewer。
+      schema:
+        type: string
+        minLength: 1
+    FriendActorIdPath:
+      name: friend_actor_id
+      in: path
+      required: true
+      description: 要解除关系的另一方 BotActor ID。
+      schema:
+        type: string
+        minLength: 1
+    FriendRequestIdPath:
+      name: request_id
+      in: path
+      required: true
+      description: FriendRequest 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    GroupIdPath:
+      name: group_id
+      in: path
+      required: true
+      description: Group 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    SessionIdPath:
+      name: session_id
+      in: path
+      required: true
+      description: Session 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    InviteTokenPath:
+      name: token
+      in: path
+      required: true
+      description: BCN 签名的 Group 或 Session 邀请令牌。
+      schema:
+        type: string
+        minLength: 1
+    ProviderIdPath:
+      name: provider_id
+      in: path
+      required: true
+      description: Provider 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    TemplateIdPath:
+      name: template_id
+      in: path
+      required: true
+      description: Collaboration Template 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    RunIdPath:
+      name: run_id
+      in: path
+      required: true
+      description: StateMachineRun 唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    NodeIdPath:
+      name: node_id
+      in: path
+      required: true
+      description: 状态机节点唯一标识。
+      schema:
+        type: string
+        minLength: 1
+    OffsetQuery:
+      name: offset
+      in: query
+      required: false
+      description: 从零开始的结果偏移量，缺省为 0。
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      description: 本次最多返回的条目数，缺省为 20，最大为 100。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    Envelope:
+      type: object
+      required: [code, message, data, request_id]
+      properties:
+        code:
+          type: integer
+          minimum: 10000
+          maximum: 59999
+          description: 五位 BCN 业务码；前三位与 HTTP status 一致，后两位为细分码。
+          example: 20000
+        message:
+          type: string
+          description: 稳定且可读的结果消息，不包含内部堆栈或敏感信息。
+          example: OK
+        data:
+          description: 接口数据。失败响应中固定为 null。
+        request_id:
+          type: string
+          description: 请求追踪 ID，与响应头 X-Trace-Id 一致。
+          example: req_bcn_001
+    ErrorEnvelope:
+      type: object
+      required: [code, message, data, request_id]
+      properties:
+        code:
+          type: integer
+          minimum: 40000
+          maximum: 59999
+          description: 五位 BCN 错误码；前三位与 HTTP status 一致，后两位为细分码。
+          example: 40000
+        message:
+          type: string
+          description: 可安全返回给调用方的错误消息。
+          example: request parameters are invalid
+        data:
+          type: "null"
+          description: 错误响应中固定为 null。
+        request_id:
+          type: string
+          description: 请求追踪 ID。
+    PageMeta:
+      type: object
+      required: [total, offset, limit]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: 满足条件的总条目数。
+        offset:
+          type: integer
+          minimum: 0
+          description: 当前结果偏移量。
+        limit:
+          type: integer
+          minimum: 1
+          description: 当前分页大小。
+    EmptyDataResponse:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data:
+              type: "null"
+              description: 操作成功且没有额外返回数据。
+
+  responses:
+    BadRequest:
+      description: 请求字段、枚举或领域约束不合法。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: 缺少凭证、凭证无效或凭证已过期。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: 身份有效，但无权代表目标 Actor 或操作目标资源。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: 资源不存在；部分查询也用 404 隐藏无权查看的资源。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: 资源已存在、当前状态不允许操作或幂等键发生冲突。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Gone:
+      description: Token 或资源已经过期、终止或不可继续使用。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    TooManyRequests:
+      description: 请求频率或资源配额超限。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    InternalError:
+      description: BCN 内部错误。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ServiceUnavailable:
+      description: Provider、Bot Runtime 或其他依赖暂不可用。
+      headers:
+        X-Trace-Id: { $ref: "#/components/headers/XTraceId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }

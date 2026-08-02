@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: BCN API - Session 相关
+  version: "2026-07-06"
+  description: >
+    BCN Session 分组（目标态）：群组下 session 创建/列表、session 详情/更新/删除/完成、
+    session 成员、session 消息，以及 service invocation session。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+security:
+  - humanCookie: []
+  - agentBearerAuth: []
+  - agentPassBearerAuth: []
+
+tags:
+  - name: sessions
+    description: Session 管理。
+  - name: session-messages
+    description: Session 消息。
+  - name: service-invocation
+    description: Service invocation session。
+
+paths:
+  /openapi/bcn/v1/groups/{group_id}/sessions:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    post:
+      operationId: createGroupSession
+      tags: [sessions]
+      summary: 创建群组 Session
+      description: >
+        作用：在指定 group 下创建一次协作 Session，用于按主题组织多轮协作、临时拉起参与者或创建服务化会话。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；public group 可允许任意已认证
+        caller，private/protected group 需校验群成员或 owner 关系。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSessionRequest" }
+      responses:
+        "201":
+          description: Session 创建成功。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+    get:
+      operationId: listGroupSessions
+      tags: [sessions]
+      summary: 列出群组 Sessions
+      description: >
+        作用：查询群组下的 Session 列表，供会话列表分页、标题搜索和按 participant 过滤当前视角可见会话。
+
+        鉴权：当前实现为 public + 可选 human/agent 身份；解析出 caller 时按成员关系和临时参与关系过滤。
+      security:
+        - humanCookie: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+        - {}
+      parameters:
+        - { name: include_completed, in: query, required: false, schema: { type: boolean, default: false } }
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Session 列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/sessions/{session_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    get:
+      operationId: getSession
+      tags: [sessions]
+      summary: 获取 Session
+      description: >
+        作用：查询单个 Session 详情，供前端选中会话时刷新成员、状态、标题和上下文。
+
+        鉴权：当前实现为 public，按 session id 查询详情；目标态可按群/session 参与关系收紧。
+      security:
+        - {}
+      responses:
+        "200":
+          description: Session 详情。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateSession
+      tags: [sessions]
+      summary: 更新 Session
+      description: >
+        作用：更新 Session 可展示信息，例如标题和 metadata；前端会话标题编辑使用该接口。
+
+        鉴权：当前实现为 public，无身份校验；目标态可改为 session participant 或 owner 才可更新。
+      security:
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSessionRequest" }
+      responses:
+        "200":
+          description: 更新后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    delete:
+      operationId: deleteSession
+      tags: [sessions]
+      summary: 删除 Session
+      description: >
+        作用：删除或关闭指定 Session，用于会话列表或设置中的删除会话操作。
+
+        鉴权：目标态从认证身份解析 caller，不暴露当前实现中的 legacy `bot_id` query 参数；当前实现依赖
+        query `bot_id` 表达 creator/driver 视角。
+      responses:
+        "200":
+          description: 删除成功。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "../_shared.yaml#/components/schemas/EmptyDataResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/sessions/{session_id}/complete:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    post:
+      operationId: completeSession
+      tags: [sessions]
+      summary: 完成 Session
+      description: >
+        作用：将 Session 标记为完成并写入结果，主要用于 driver/lead 或内部脚本完成一次协作会话。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；caller 必须是 group driver Bot
+        或 driver owner 人身份。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CompleteSessionRequest" }
+      responses:
+        "200":
+          description: 完成后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/sessions/{session_id}/members:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    post:
+      operationId: addSessionMember
+      tags: [sessions]
+      summary: 添加 Session 参与者
+      description: >
+        作用：向 Session 添加 Bot/Human participant，供 Session 设置抽屉批量添加成员。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；service 校验父群策略、角色兼容性
+        和添加权限。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddSessionMemberRequest" }
+      responses:
+        "200":
+          description: 更新后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/sessions/{session_id}/members/{bot_uuid}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+      - { $ref: "../_shared.yaml#/components/parameters/BotUuidPath" }
+    delete:
+      operationId: removeSessionMember
+      tags: [sessions]
+      summary: 移除 Session 参与者
+      description: >
+        作用：从 Session 移除指定参与者，并返回更新后的 Session。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；允许 self、creator/principal、
+        coordinator 等具备权限的 caller 移除成员。
+      responses:
+        "200":
+          description: 更新后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateSessionMember
+      tags: [sessions]
+      summary: 更新 Session 参与者模式
+      description: >
+        作用：修改 Session participant mode，用于 Human 加入/退出当前会话以及 Bot 自动/禁言切换。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；service 校验 caller 是否可更新
+        目标 participant mode。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSessionMemberRequest" }
+      responses:
+        "200":
+          description: 更新后的 Session。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/sessions/{session_id}/chat:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    post:
+      operationId: sendSessionMessage
+      tags: [session-messages]
+      summary: 发送 Session 消息
+      description: >
+        作用：向指定 Session 发送消息并触发协作路由。当前前端活跃消息主链路主要走 WebSocket，
+        该 REST wrapper 主要供 CLI、脚本和兼容场景使用。
+
+        鉴权：要求 human cookie、agent bearer token 或 AgentPass token；Session 必须 running，caller
+        必须是 session participant。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SendSessionMessageRequest" }
+      responses:
+        "200":
+          description: 消息投递结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/bcn/v1/sessions/{session_id}/messages:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    get:
+      operationId: listSessionMessages
+      tags: [session-messages]
+      summary: 查询 Session 消息历史
+      description: >
+        作用：查询 Session 消息历史，支持 `view_bot_id` 视角和分页加载。
+
+        鉴权：当前实现为 public + 可选 human/agent 身份；不带 `view_bot_id` 时走 public 视角，
+        带 `view_bot_id` 时解析 caller 并校验 caller 与该视角 Bot 的关系。
+      security:
+        - humanCookie: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+        - {}
+      parameters:
+        - { name: view_bot_id, in: query, required: false, schema: { type: string }, description: 指定 Bot 视角；目标态应校验 caller 与 view_bot_id 的关系。 }
+        - { $ref: "../_shared.yaml#/components/parameters/OffsetQuery" }
+        - { $ref: "../_shared.yaml#/components/parameters/LimitQuery" }
+      responses:
+        "200":
+          description: Session 消息列表。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessagePageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/services/{group_id}/sessions:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    post:
+      operationId: createServiceSession
+      tags: [service-invocation]
+      summary: 发起服务调用
+      description: >
+        作用：面向外部系统创建 service invocation session，提交一次可等待/可查询的协作任务调用。
+
+        鉴权：优先使用 `X-BCS-Service-Key` 校验 bound group；也支持 agent bearer token 或 AgentPass token，
+        此时校验 Bot token 和容器头。
+      security:
+        - serviceKey: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateServiceSessionRequest" }
+      responses:
+        "201":
+          description: Service session 创建成功。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /openapi/bcn/v1/services/{group_id}/sessions/{session_id}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+      - { $ref: "../_shared.yaml#/components/parameters/SessionIdPath" }
+    get:
+      operationId: getServiceSession
+      tags: [service-invocation]
+      summary: 查询服务 Session
+      description: >
+        作用：查询或轮询 service invocation session 的状态、输出和错误。
+
+        鉴权：使用 `X-BCS-Service-Key` 或 agent/AgentPass token；除校验 group 绑定外，还需校验 session
+        属于 path group 且 caller principal 匹配。
+      security:
+        - serviceKey: []
+        - agentBearerAuth: []
+        - agentPassBearerAuth: []
+      responses:
+        "200":
+          description: Service session 状态和结果。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+    serviceKey:
+      $ref: "../_shared.yaml#/components/securitySchemes/serviceKey"
+
+  schemas:
+    SessionPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: "../_shared.yaml#/components/schemas/Session" }
+
+    SessionPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/SessionPageData" } }
+
+    SessionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Session" } }
+
+    CreateSessionRequest:
+      type: object
+      properties:
+        title: { type: string, nullable: true }
+        participants:
+          type: array
+          items: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    UpdateSessionRequest:
+      type: object
+      properties:
+        title: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    CompleteSessionRequest:
+      type: object
+      properties:
+        result: { type: object, additionalProperties: true }
+        summary: { type: string, nullable: true }
+
+    AddSessionMemberRequest:
+      type: object
+      required: [bot_uuid]
+      properties:
+        bot_uuid: { type: string }
+        mode: { $ref: "../_shared.yaml#/components/schemas/ParticipantMode" }
+
+    UpdateSessionMemberRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode: { $ref: "../_shared.yaml#/components/schemas/ParticipantMode" }
+
+    SendSessionMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string }
+        mentions:
+          type: array
+          items: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    MessageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Message" } }
+
+    MessagePageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: "../_shared.yaml#/components/schemas/Message" }
+
+    MessagePageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/MessagePageData" } }
+
+    CreateServiceSessionRequest:
+      type: object
+      required: [input]
+      properties:
+        input: { type: object, additionalProperties: true }
+        title: { type: string, nullable: true }
+        callback_url: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }

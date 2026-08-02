@@ -1,0 +1,238 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - State Machine Runs
+  version: "2026-07-20"
+  description: 状态机协作运行的启动、查询、图、节点详情和取消接口。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: state-machine-runs
+    description: 只面向受信任内部服务和运维身份的状态机运行资源。
+
+paths:
+  /api/v1/bcn/groups/{group_id}/state-machine-runs:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/GroupIdPath"
+    post:
+      operationId: startStateMachineRunInternal
+      tags: [state-machine-runs]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "400":
+          - { code: 40016, message: state machine run request is invalid, condition: input、metadata、CollaborationDefinition 或 Group 策略不满足运行约束。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Internal Service Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Internal Service Token 无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务不具备目标 Group 的运行权限。 }
+        "404":
+          - { code: 40403, message: group was not found, condition: Group 或其有效 CollaborationDefinition 不存在。 }
+        "409":
+          - { code: 40910, message: state machine run state does not allow the operation, condition: Group 已存在互斥运行，或当前运行状态不允许启动新 Run。 }
+      summary: 启动 StateMachineRun
+      description: >
+        基于 Group 当前版本绑定的 CollaborationDefinition 启动一次独立运行。Body 可省略；input 和
+        metadata 省略时都使用空对象。调用方必须是受信任内部服务，并具有目标 Group 的内部访问权限。
+        Group 不是 state_machine、没有有效 definition 或请求不合法返回 400；并发运行冲突返回 409。
+      security:
+        - internalServiceBearer: []
+      requestBody:
+        required: false
+        description: 可选运行输入和内部观测元数据。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartStateMachineRunRequest" }
+      responses:
+        "202":
+          description: Run 已创建并进入 queued 或 running，尚未保证完成。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineRunResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /api/v1/bcn/state-machine-runs/{run_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/RunIdPath"
+    get:
+      operationId: getStateMachineRunInternal
+      tags: [state-machine-runs]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Internal Service Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Internal Service Token 无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务不具备 Run 所属 Group 的读取权限。 }
+        "404":
+          - { code: 40409, message: state machine run was not found, condition: StateMachineRun 不存在或对调用方不可见。 }
+      summary: 查询 StateMachineRun
+      description: >
+        查询 Run 基本状态、输入、结果、错误和时间。调用方必须具有该 Run 所属 Group 的内部访问权限。
+        running/queued 时 output、error_message、completed_at 省略；succeeded 时返回 output；
+        failed 时返回 error_message；cancelled 时返回 completed_at，output 通常省略。
+      security:
+        - internalServiceBearer: []
+      responses:
+        "200":
+          description: 根据 status 返回当前可用字段的 StateMachineRun。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineRunResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/v1/bcn/state-machine-runs/{run_id}/graph:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/RunIdPath"
+    get:
+      operationId: getStateMachineRunGraphInternal
+      tags: [state-machine-runs]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Internal Service Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Internal Service Token 无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务不具备 Run 所属 Group 的观测权限。 }
+        "404":
+          - { code: 40409, message: state machine run was not found, condition: StateMachineRun 或运行图不存在，或对调用方不可见。 }
+      summary: 查询 StateMachineRun 图
+      description: 查询 Run 的节点、边和每个节点的当前执行状态，用于内部观测和问题排查。
+      security:
+        - internalServiceBearer: []
+      responses:
+        "200":
+          description: Run 图结构及节点进度。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineGraphResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/v1/bcn/state-machine-runs/{run_id}/nodes/{node_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/RunIdPath"
+      - $ref: "../_shared.yaml#/components/parameters/NodeIdPath"
+    get:
+      operationId: getStateMachineNodeRunInternal
+      tags: [state-machine-runs]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Internal Service Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Internal Service Token 无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务不具备 Run 所属 Group 的观测权限。 }
+        "404":
+          - { code: 40410, message: state machine node run was not found, condition: StateMachineRun、node_id 或对应 NodeRun 不存在。 }
+      summary: 查询状态机节点运行详情
+      description: >
+        查询单个节点的状态、输入、输出、错误和时间。queued 时只有 node_id/status；running 时可包含
+        input/started_at；succeeded 返回 output；failed 返回 error_message。Run 或 Node 不存在都返回 404。
+      security:
+        - internalServiceBearer: []
+      responses:
+        "200":
+          description: 随节点状态变化的 StateMachineNodeRun。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StateMachineNodeRunResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/v1/bcn/state-machine-runs/{run_id}/cancel:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/RunIdPath"
+    post:
+      operationId: cancelStateMachineRunInternal
+      tags: [state-machine-runs]
+      x-api-type: internal
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Internal Service Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Internal Service Token 无效或已经过期。 }
+        "403":
+          - { code: 40309, message: internal service is not authorized for this operation, condition: 内部服务不具备 Run 所属 Group 的取消权限。 }
+        "404":
+          - { code: 40409, message: state machine run was not found, condition: StateMachineRun 不存在或对调用方不可见。 }
+        "409":
+          - { code: 40910, message: state machine run state does not allow the operation, condition: Run 已完成、失败或取消，不能再次取消。 }
+      summary: 取消 StateMachineRun
+      description: >
+        取消 queued 或 running Run，无请求体。成功返回 status=cancelled 的完整 Run。
+        已经 cancelled 时幂等返回 200；succeeded 或 failed 等不可取消状态返回 409。
+      security:
+        - internalServiceBearer: []
+      responses:
+        "200":
+          description: cancelled Run；幂等重试返回相同结构。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancelledStateMachineRunResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    internalServiceBearer: { $ref: "../_shared.yaml#/components/securitySchemes/internalServiceBearer" }
+  schemas:
+    StartStateMachineRunRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        input:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: Run 输入；省略时为空对象。
+        metadata:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: 内部追踪、来源等运行级扩展；省略时为空对象。
+    StateMachineRunResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/StateMachineRun" }
+    StateMachineGraphResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/StateMachineGraph" }
+    StateMachineNodeRunResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/StateMachineNodeRun" }
+    CancelledStateMachineRun:
+      allOf:
+        - $ref: "../domain-models.yaml#/components/schemas/StateMachineRun"
+        - type: object
+          required: [status, completed_at]
+          properties:
+            status: { type: string, const: cancelled, description: 固定为 cancelled。 }
+    CancelledStateMachineRunResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CancelledStateMachineRun" }

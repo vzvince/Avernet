@@ -1,0 +1,379 @@
+openapi: 3.1.0
+info:
+  title: BCN OpenAPI - Providers
+  version: "2026-07-20"
+  description: Provider 查询和更新，以及 Provider 管理的 Bot 注册和查询。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+tags:
+  - name: providers
+    description: Provider 配置、接入和生命周期。
+  - name: provider-bots
+    description: Provider 注册的 BotActor 和 ProviderBotBinding。
+
+paths:
+  /openapi/v1/bcn/providers/{provider_id}:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ProviderIdPath"
+    get:
+      operationId: getProvider
+      tags: [providers]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Provider Admin Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Provider Admin Token 无效或已经过期。 }
+        "403":
+          - { code: 40306, message: caller is not allowed to manage the specified provider, condition: Token 不属于路径中的 Provider。 }
+        "404":
+          - { code: 40405, message: provider was not found, condition: Provider 不存在，或调用方无权知道其是否存在。 }
+      summary: 获取 Provider
+      description: >
+        返回 Provider 基本信息、支持的连接方式和非敏感 Gateway 配置。Provider Admin Token 必须
+        与 provider_id 匹配。响应绝不包含 Provider Admin Token、下行密钥或 Bot Runtime Token。
+      security:
+        - providerAdminBearer: []
+      responses:
+        "200":
+          description: Provider 安全视图。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateProvider
+      tags: [providers]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40012, message: provider configuration is invalid, condition: supported_conn_types、gateway_config 或其他 Provider 配置不合法。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Provider Admin Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Provider Admin Token 无效或已经过期。 }
+        "403":
+          - { code: 40306, message: caller is not allowed to manage the specified provider, condition: Token 不属于路径中的 Provider。 }
+        "404":
+          - { code: 40405, message: provider was not found, condition: Provider 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40911, message: provider state does not allow the operation, condition: 仍有 Bot 使用待删除的连接方式，或 Provider 当前状态不允许修改。 }
+      summary: 更新 Provider
+      description: >
+        Provider Admin Token 和 HumanCookie 必须同时提供，且 Human 必须有 Provider 管理权限。
+        至少修改 name、supported_conn_types、gateway_config、enabled 之一；provider_id 和 slug 不可修改。
+        更新后的 supported_conn_types 包含 gateway 时 gateway_config 必须存在；移除某种连接方式前，
+        不得存在仍使用该 conn_type 的有效 ProviderBotBinding。
+      security:
+        - providerAdminBearer: []
+          humanCookie: []
+      requestBody:
+        required: true
+        description: Provider 可变字段的部分更新。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProviderRequest" }
+      responses:
+        "200":
+          description: 更新后的 Provider 安全视图。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+  /openapi/v1/bcn/providers/{provider_id}/bots:
+    parameters:
+      - $ref: "../_shared.yaml#/components/parameters/ProviderIdPath"
+    get:
+      operationId: listProviderBots
+      tags: [provider-bots]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Provider Admin Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Provider Admin Token 无效或已经过期。 }
+        "403":
+          - { code: 40306, message: caller is not allowed to manage the specified provider, condition: Token 不属于路径中的 Provider。 }
+        "404":
+          - { code: 40405, message: provider was not found, condition: Provider 不存在，或调用方无权知道其是否存在。 }
+      summary: 查询 Provider Bot
+      description: >
+        查询当前 Provider 注册的 BotActor 和 ProviderBotBinding。Provider Admin Token 必须与路径
+        Provider 匹配。列表不返回任何明文凭证。
+      security:
+        - providerAdminBearer: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: 按 Bot 名称或 provider_bot_ref 模糊过滤。
+          schema: { type: string }
+        - name: conn_type
+          in: query
+          required: false
+          description: 只返回使用 plugin 或 gateway 的 Binding。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/ProviderConnectionType" }
+        - name: collaboration_status
+          in: query
+          required: false
+          description: 按 BotActor 协作状态过滤。
+          schema: { $ref: "../domain-models.yaml#/components/schemas/CollaborationStatus" }
+        - $ref: "../_shared.yaml#/components/parameters/OffsetQuery"
+        - $ref: "../_shared.yaml#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: 分页 ProviderBot 记录，每项包含 actor 和 binding。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderBotPageResponse" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    post:
+      operationId: registerProviderBot
+      tags: [provider-bots]
+      x-api-type: openapi
+      x-bcn-error-codes:
+        "400":
+          - { code: 40012, message: provider configuration is invalid, condition: provider_bot_ref、conn_type 或 Bot 注册字段不满足 Provider 约束。 }
+        "401":
+          - { code: 40100, message: authentication is required, condition: 请求没有携带 Provider Admin Token。 }
+          - { code: 40101, message: credential is invalid or expired, condition: Provider Admin Token 无效或已经过期。 }
+        "403":
+          - { code: 40306, message: caller is not allowed to manage the specified provider, condition: Token 不属于路径中的 Provider。 }
+        "404":
+          - { code: 40405, message: provider was not found, condition: Provider 不存在，或调用方无权知道其是否存在。 }
+        "409":
+          - { code: 40907, message: bot identity already exists, condition: provider_bot_ref、agent_code 或目标 Bot 身份已经存在。 }
+      summary: 通过 Provider 注册 Bot
+      description: >
+        创建 BotActor、ProviderBotBinding 和 creates 关系。provider_bot_ref、conn_type、created_by、name
+        必填；conn_type 必须在 Provider.supported_conn_types 中。plugin 首次注册返回一次 Bot Runtime Token；
+        gateway 首次注册不返回 Runtime Token。相同 provider_bot_ref 的幂等重试返回 200 和已有资源，
+        不重放任何明文凭证；同一引用但请求内容冲突返回 409。
+      security:
+        - providerAdminBearer: []
+      requestBody:
+        required: true
+        description: Provider 命名空间中的 Bot 标识、连接方式、创建来源和能力描述。
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterProviderBotRequest" }
+      responses:
+        "200":
+          description: 幂等命中已有 BotActor 和 Binding；无论 conn_type 都不返回 credentials。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExistingProviderBotResponse" }
+        "201":
+          description: >
+            conn_type=plugin 时返回 PluginProviderBotCreatedData，包含一次性 bot_runtime_token；
+            conn_type=gateway 时返回 GatewayProviderBotCreatedData，不包含 credentials。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderBotCreatedResponse" }
+              examples:
+                plugin:
+                  value:
+                    code: 20100
+                    message: OK
+                    data:
+                      actor:
+                        actor_id: bot_plugin
+                        kind: bot
+                        name: Plugin Bot
+                        visibility: protected
+                        collaboration_status: enabled
+                        created_by: "123456"
+                        descriptor:
+                          summary: Direct bot
+                          domains: []
+                          skills: []
+                          scopes: []
+                          provider: { provider_id: prv_001, slug: example, name: Example }
+                        reachability: unreachable
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                      binding:
+                        actor_id: bot_plugin
+                        provider_id: prv_001
+                        provider_bot_ref: plugin-001
+                        conn_type: plugin
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                      credentials: { bot_runtime_token: runtime-token }
+                    request_id: req_provider_bot_001
+                gateway:
+                  value:
+                    code: 20100
+                    message: OK
+                    data:
+                      actor:
+                        actor_id: bot_gateway
+                        kind: bot
+                        name: Gateway Bot
+                        visibility: protected
+                        collaboration_status: enabled
+                        created_by: "123456"
+                        descriptor:
+                          summary: Downlink bot
+                          domains: []
+                          skills: []
+                          scopes: []
+                          provider: { provider_id: prv_001, slug: example, name: Example }
+                        reachability: reachable
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                      binding:
+                        actor_id: bot_gateway
+                        provider_id: prv_001
+                        provider_bot_ref: gateway-001
+                        conn_type: gateway
+                        gmt_create: 1784512800000
+                        gmt_modified: 1784512800000
+                    request_id: req_provider_bot_002
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "409": { $ref: "../_shared.yaml#/components/responses/Conflict" }
+
+components:
+  securitySchemes:
+    humanCookie: { $ref: "../_shared.yaml#/components/securitySchemes/humanCookie" }
+    providerAdminBearer: { $ref: "../_shared.yaml#/components/securitySchemes/providerAdminBearer" }
+  schemas:
+    ProviderResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "../domain-models.yaml#/components/schemas/Provider" }
+    UpdateProviderRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, description: 新展示名称；省略表示不修改。 }
+        supported_conn_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: 完整替换支持的连接方式；省略表示不修改。
+          items: { $ref: "../domain-models.yaml#/components/schemas/ProviderConnectionType" }
+        gateway_config: { $ref: "../domain-models.yaml#/components/schemas/ProviderGatewayConfig" }
+        enabled: { type: boolean, description: 是否允许继续注册和投递 Bot；省略表示不修改。 }
+    ProviderBotRecord:
+      type: object
+      required: [actor, binding]
+      properties:
+        actor: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+        binding: { $ref: "../domain-models.yaml#/components/schemas/ProviderBotBinding" }
+    ProviderBotPageData:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/PageMeta"
+        - type: object
+          required: [provider_id, items]
+          properties:
+            provider_id: { type: string, description: 被查询的 Provider ID。 }
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/ProviderBotRecord" }
+              description: Provider 注册的 BotActor 和 Binding。
+    ProviderBotPageResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ProviderBotPageData" }
+    BotDescriptorInput:
+      type: object
+      additionalProperties: false
+      properties:
+        summary: { type: string, default: "", description: Bot 简要说明；省略为空字符串。 }
+        domains:
+          type: array
+          default: []
+          description: Bot 领域；省略为空数组。
+          items: { type: string }
+        skills:
+          type: array
+          default: []
+          description: Bot 技能；省略为空数组。
+          items: { $ref: "../domain-models.yaml#/components/schemas/Skill" }
+        scopes:
+          type: array
+          default: []
+          description: Bot scope；省略为空数组。
+          items: { type: string }
+    RegisterProviderBotRequest:
+      type: object
+      required: [provider_bot_ref, conn_type, created_by, name]
+      additionalProperties: false
+      properties:
+        provider_bot_ref: { type: string, minLength: 1, description: Bot 在 Provider 命名空间中的唯一标识。 }
+        conn_type: { $ref: "../domain-models.yaml#/components/schemas/ProviderConnectionType" }
+        agent_code: { type: string, description: 可选外部 Agent 身份；存在时在环境内唯一。 }
+        created_by: { type: string, minLength: 1, description: 创建人的工号，用于不可变 creates 关系。 }
+        name: { type: string, minLength: 1, description: BotActor 展示名称。 }
+        visibility: { allOf: [{ $ref: "../domain-models.yaml#/components/schemas/ActorVisibility" }], default: protected, description: 初始可见性；省略为 protected。 }
+        descriptor: { $ref: "#/components/schemas/BotDescriptorInput" }
+    BotRuntimeCredential:
+      type: object
+      required: [bot_runtime_token]
+      description: Plugin Bot 首次注册使用的直连凭证，仅返回一次。
+      properties:
+        bot_runtime_token: { type: string, description: Bot Runtime Token；调用方必须安全保存。 }
+    PluginProviderBotCreatedData:
+      type: object
+      required: [actor, binding, credentials]
+      properties:
+        actor: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+        binding:
+          description: conn_type 固定为 plugin 的 ProviderBotBinding。
+          allOf:
+            - $ref: "../domain-models.yaml#/components/schemas/ProviderBotBinding"
+            - type: object
+              required: [conn_type]
+              properties:
+                conn_type: { type: string, const: plugin, description: 固定为 plugin。 }
+        credentials: { $ref: "#/components/schemas/BotRuntimeCredential" }
+    GatewayProviderBotCreatedData:
+      type: object
+      required: [actor, binding]
+      properties:
+        actor: { $ref: "../domain-models.yaml#/components/schemas/BotActor" }
+        binding:
+          description: conn_type 固定为 gateway 的 ProviderBotBinding。
+          allOf:
+            - $ref: "../domain-models.yaml#/components/schemas/ProviderBotBinding"
+            - type: object
+              required: [conn_type]
+              properties:
+                conn_type: { type: string, const: gateway, description: 固定为 gateway。 }
+    ProviderBotCreatedData:
+      oneOf:
+        - $ref: "#/components/schemas/PluginProviderBotCreatedData"
+        - $ref: "#/components/schemas/GatewayProviderBotCreatedData"
+    ProviderBotCreatedResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ProviderBotCreatedData" }
+    ExistingProviderBotResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ProviderBotRecord" }

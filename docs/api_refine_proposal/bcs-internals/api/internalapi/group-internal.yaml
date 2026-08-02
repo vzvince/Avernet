@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - 群组内部控制
+  version: "2026-07-06"
+  description: >
+    BCN/BCS 群组内部控制接口。REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: group-internal-control
+    description: 群组内部控制。
+
+paths:
+  /api/bcn/v1/groups/{group_id}/collaboration-definition:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    get:
+      operationId: getGroupCollaborationDefinition
+      tags: [group-internal-control]
+      summary: 获取协作定义
+      description: >
+        作用：读取 state_machine 或其它协作型群组的内部协作定义，主要用于内部调试和运维。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API，不作为外部 OpenAPI 暴露。
+      security: []
+      responses:
+        "200":
+          description: 协作定义。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollaborationDefinitionResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+    patch:
+      operationId: updateGroupCollaborationDefinition
+      tags: [group-internal-control]
+      summary: 更新协作定义
+      description: >
+        作用：更新群组内部协作定义 YAML/结构，用于修正或维护 state_machine 群配置。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API，后续可按运维权限收紧。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateCollaborationDefinitionRequest" }
+      responses:
+        "200":
+          description: 更新后的协作定义。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollaborationDefinitionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/groups/{group_id}/collaboration-definition/upgrade:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    post:
+      operationId: upgradeGroupCollaborationDefinition
+      tags: [group-internal-control]
+      summary: 升级协作定义
+      description: >
+        作用：将旧协作定义升级到新的结构或版本，服务内部迁移/维护使用。
+
+        鉴权：当前实现为 public，无身份校验；属于 internal API。
+      security: []
+      responses:
+        "200":
+          description: 升级后的协作定义。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollaborationDefinitionResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/groups/{group_id}/settings:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/GroupIdPath" }
+    patch:
+      operationId: updateGroupSettings
+      tags: [group-internal-control]
+      summary: 更新群设置
+      description: >
+        作用：修改群组标题、描述、metadata 等内部设置；当前未发现产品前端主链路使用。
+
+        鉴权：当前实现为 public，无身份校验；已作为 internal API 标记，后续可按群 owner/运维权限收紧。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateGroupSettingsRequest" }
+      responses:
+        "200":
+          description: 更新后的群组。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GroupResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "401": { $ref: "../_shared.yaml#/components/responses/Unauthorized" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    humanCookie:
+      $ref: "../_shared.yaml#/components/securitySchemes/humanCookie"
+    agentBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentBearerAuth"
+    agentPassBearerAuth:
+      $ref: "../_shared.yaml#/components/securitySchemes/agentPassBearerAuth"
+  schemas:
+    GroupResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "../_shared.yaml#/components/schemas/Group" } }
+
+    CollaborationDefinition:
+      type: object
+      additionalProperties: true
+
+    CollaborationDefinitionResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/CollaborationDefinition" } }
+
+    UpdateCollaborationDefinitionRequest:
+      type: object
+      required: [definition]
+      properties:
+        definition: { $ref: "#/components/schemas/CollaborationDefinition" }
+
+    UpdateGroupSettingsRequest:
+      type: object
+      properties:
+        title: { type: string }
+        description: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }

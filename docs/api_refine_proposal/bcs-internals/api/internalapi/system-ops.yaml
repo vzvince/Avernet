@@ -1,0 +1,138 @@
+openapi: 3.1.0
+info:
+  title: BCN Internal API - 系统/运维
+  version: "2026-07-06"
+  description: >
+    BCN/BCS 系统与运维内部接口。REST JSON 响应统一使用 `Envelope`。
+servers:
+  - url: https://bcn-prod.alipay.com
+    description: 生产环境
+  - url: https://bcn-pre.alipay.com
+    description: 预发环境
+
+tags:
+  - name: system-ops
+    description: 系统/运维。
+
+paths:
+  /api/bcn/v1/health:
+    get:
+      operationId: getBcnHealth
+      tags: [system-ops]
+      summary: 健康检查
+      description: >
+        作用：返回 BCN/BCS 服务健康状态，用于探活、发布检查和基础可用性确认。
+
+        鉴权：当前实现为 public，无身份校验。
+      security: []
+      responses:
+        "200":
+          description: 服务健康状态。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /api/bcn/v1/metrics:
+    get:
+      operationId: getBcnMetrics
+      tags: [system-ops]
+      summary: Prometheus 指标
+      description: >
+        作用：Prometheus scrape endpoint，响应为 Prometheus text exposition format。
+
+        鉴权：当前实现为 public 或由部署层网络策略保护；接口本身不做应用身份校验。
+      security: []
+      responses:
+        "200":
+          description: Prometheus metrics text.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /api/bcn/v1/manifest:
+    get:
+      operationId: getBcnManifest
+      tags: [system-ops]
+      summary: 获取前端 bundle manifest
+      description: >
+        作用：读取前端 bundle manifest，用于内部前端资源定位或静态资源服务。
+
+        鉴权：当前实现为 public，无身份校验。
+      security: []
+      responses:
+        "200":
+          description: Manifest 内容。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ManifestResponse" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+
+  /api/bcn/v1/admin/secret/{name}:
+    parameters:
+      - { $ref: "../_shared.yaml#/components/parameters/SecretNamePath" }
+    get:
+      operationId: getBcnSecret
+      tags: [system-ops]
+      summary: 拉取服务密钥
+      description: >
+        作用：本机 admin/运维能力，用于从服务侧拉取指定 secret。
+
+        鉴权：仅允许 loopback 调用；非本机请求返回 403。
+      security:
+        - loopback: []
+      responses:
+        "200":
+          description: Secret 值。
+          headers: { X-Trace-Id: { $ref: "../_shared.yaml#/components/headers/XTraceId" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretResponse" }
+        "400": { $ref: "../_shared.yaml#/components/responses/BadRequest" }
+        "403": { $ref: "../_shared.yaml#/components/responses/Forbidden" }
+        "404": { $ref: "../_shared.yaml#/components/responses/NotFound" }
+        "503": { $ref: "../_shared.yaml#/components/responses/ServiceUnavailable" }
+
+components:
+  securitySchemes:
+    loopback:
+      $ref: "../_shared.yaml#/components/securitySchemes/loopback"
+
+  schemas:
+    HealthData:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+        service: { type: string, nullable: true }
+        version: { type: string, nullable: true }
+
+    HealthResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/HealthData" } }
+
+    ManifestData:
+      type: object
+      additionalProperties: true
+
+    ManifestResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/ManifestData" } }
+
+    SecretData:
+      type: object
+      required: [name, value]
+      properties:
+        name: { type: string }
+        value: { type: string }
+
+    SecretResponse:
+      allOf:
+        - $ref: "../_shared.yaml#/components/schemas/Envelope"
+        - type: object
+          properties: { data: { $ref: "#/components/schemas/SecretData" } }
