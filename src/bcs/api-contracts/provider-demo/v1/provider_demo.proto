@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package bcs.provider.demo.v1;
+
+option java_multiple_files = true;
+option java_package = "com.avernet.bcs.provider.demo.v1";
+option java_outer_classname = "ProviderDemoProto";
+
+service ProviderDemo {
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+}
+
+message InvokeRequest {
+  string message = 1;
+}
+
+message InvokeResponse {
+  string message = 1;
+  string implementation = 2;
+}
