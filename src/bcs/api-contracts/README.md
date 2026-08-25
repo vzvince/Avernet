@@ -19,6 +19,23 @@ uv run --with pytest --with pyyaml --with jsonschema \
   pytest src/bcs/tests/event_contract -q
 ```
 
+## Provider gRPC SDK Demo Contract
+
+`provider-demo/v1/provider_demo.proto` is the canonical cross-language wire
+contract for the Python SDK, Java SDK, and standalone Rust client demo. It
+defines one unary `ProviderDemo.Invoke` operation solely to validate SDK
+inheritance and gRPC interoperability.
+
+Validate the checked-in contract shape without changing repository-wide
+Python dependencies:
+
+```bash
+uv run --with pytest pytest src/bcs/tests/provider_grpc_sdk_demo -q
+```
+
+This demo contract is separate from, and does not modify, the current Provider
+SSE protocol. It is not the final bidirectional Provider streaming contract.
+
 ## Collaboration HTTP APIs
 
 `v1/openapi.yaml` is the source of truth for the versioned public BCN OpenAPI.
