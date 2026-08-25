@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bcs-provider-sdk-demo"
+version = "0.1.0"
+description = "Minimal inheritable gRPC Provider SDK demonstration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "grpcio>=1.68,<2",
+    "protobuf>=5,<7",
+]
+
+[project.optional-dependencies]
+test = [
+    "grpcio-tools>=1.68,<2",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
