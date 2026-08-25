@@ -1,8 +1,14 @@
+import re
+from pathlib import Path
+
 import grpc
 import pytest
 
 from bcs_provider_sdk import ProviderServer, ProviderService
 from bcs_provider_sdk._generated import provider_demo_pb2, provider_demo_pb2_grpc
+
+
+SDK_ROOT = Path(__file__).parents[1]
 
 
 class EchoProvider(ProviderService):
@@ -22,6 +28,33 @@ class FailingProvider(ProviderService):
     async def invoke(self, message: str) -> str:
         del message
         raise RuntimeError("secret detail")
+
+
+def test_runtime_dependency_floors_match_generated_modules() -> None:
+    grpc_source = (
+        SDK_ROOT
+        / "src/bcs_provider_sdk/_generated/provider_demo_pb2_grpc.py"
+    ).read_text(encoding="utf-8")
+    protobuf_source = (
+        SDK_ROOT
+        / "src/bcs_provider_sdk/_generated/provider_demo_pb2.py"
+    ).read_text(encoding="utf-8")
+    grpc_version = re.search(
+        r"GRPC_GENERATED_VERSION = '([^']+)'",
+        grpc_source,
+    )
+    protobuf_version = re.search(
+        r"# Protobuf Python Version: ([0-9.]+)",
+        protobuf_source,
+    )
+    assert grpc_version is not None
+    assert protobuf_version is not None
+
+    project = (SDK_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert f'"grpcio>={grpc_version.group(1)},<2"' in project
+    assert f'"grpcio-tools>={grpc_version.group(1)},<2"' in project
+    assert f'"protobuf>={protobuf_version.group(1)},<7"' in project
 
 
 @pytest.mark.asyncio
