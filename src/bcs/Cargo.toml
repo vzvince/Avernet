@@ -95,6 +95,7 @@ members = [
     # tools
     "crates/tools/bcs-admin",
     "crates/tools/bcs-cli",
+    "crates/tools/bcs-provider-demo-client",
     "crates/tools/bcs-rule-bot",
     # auxiliary
     "crates/auxiliary/bcs-telemetry",
