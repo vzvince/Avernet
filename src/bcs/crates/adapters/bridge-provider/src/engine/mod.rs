@@ -1,3 +1,4 @@
+pub mod cfuse_cc;
 pub mod cli;
 
 use std::path::PathBuf;
@@ -36,12 +37,20 @@ pub struct TurnOutcome {
 
 /// Engine turn errors. `EngineExited` carries the engine's own exit reason;
 /// `Aborted` is returned when the run is cancelled via the abort token.
-#[derive(Debug)]
+/// `Io` is raised on stdout/stdin IO failures (e.g. broken pipe) and converts
+/// from [`std::io::Error`] via `?` for the driver's read/write paths.
+#[derive(Debug, thiserror::Error)]
 pub enum TurnError {
+    #[error("spawn engine: {0}")]
     Spawn(std::io::Error),
+    #[error("engine exited: {0}")]
     EngineExited(String),
+    #[error("engine turn aborted")]
     Aborted,
+    #[error("engine protocol error: {0}")]
     Protocol(String),
+    #[error("engine io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[async_trait::async_trait]
@@ -78,11 +87,16 @@ impl Engine for StubEngine {
     }
 }
 
-/// Build an [`Engine`] for `bot`. Until Tasks 9/10 land the real drivers, this
-/// returns a [`StubEngine`] that records the configured engine kind and fails
-/// every turn with `EngineExited("engine not wired")`.
+/// Build an [`Engine`] for `bot`. `CfuseCc` is wired to the real driver
+/// ([`cfuse_cc::CfuseCc`]); `CfuseCodex` stays on the [`StubEngine`] until
+/// Task 10 lands its driver.
 pub fn build_engine(bot: &BotConfig) -> Arc<dyn Engine> {
-    Arc::new(StubEngine { kind: bot.engine })
+    match bot.engine {
+        EngineKind::CfuseCc => Arc::new(cfuse_cc::CfuseCc::new(
+            bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
+        )),
+        EngineKind::CfuseCodex => Arc::new(StubEngine { kind: bot.engine }),
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +155,20 @@ mod tests {
             TurnError::EngineExited(msg) => assert_eq!(msg, "engine not wired"),
             other => panic!("expected EngineExited, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn build_engine_wires_cfuse_cc_driver() {
+        // 不 spawn：只确认 build_engine 对 CfuseCc 返回真实驱动（而非 stub）。
+        let bot = BotConfig {
+            provider_bot_ref: "cc-worker".into(),
+            engine: EngineKind::CfuseCc,
+            model: None,
+            cwd: "/tmp".into(),
+            permission_mode: None,
+            cfuse_bin: Some(PathBuf::from("/usr/local/bin/cfuse")),
+        };
+        let engine = build_engine(&bot);
+        assert_eq!(engine.kind(), EngineKind::CfuseCc);
     }
 }
