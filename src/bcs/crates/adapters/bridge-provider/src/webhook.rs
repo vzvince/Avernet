@@ -115,43 +115,62 @@ async fn handle_chat_send(
     let run_id = req.id.clone();
     let fp = crate::run::body_fingerprint(&req, &session_id);
 
-    // 5. Idempotency: same id present?
-    if let Some(handle) = state.runs.get(&run_id) {
+    // 5. Atomic begin FIRST — get-or-create the run entry BEFORE claiming the
+    //    session slot. This closes the startup TOCTOU between
+    //    `sessions.try_start_run` (sets `active_run`) and `runs.begin` (creates
+    //    the registry entry): a chat.abort landing in that window used to see
+    //    `active_run=Some` + `runs.get(None)` and wrongly return
+    //    `{"aborted":false}`. With begin-first, the registry entry exists the
+    //    moment `active_run` becomes `Some`, so the abort handler always reads
+    //    a consistent pair.
+    //
+    // Re-attach ordering (Task 11): a same-id retry MUST NOT 429 and MUST NOT
+    // touch the session slot. `begin` is the get-or-create atomic — it returns
+    // `is_new == false` for an existing id, so the re-attach / terminal-replay
+    // / conflict decision below runs entirely before `try_start_run` (which is
+    // new-id only). Same-id retries with a different body still 409.
+    let (handle, is_new) = state.runs.begin(&run_id, fp.clone());
+    if !is_new {
         if !handle.matches(&fp) {
-            // same id, different body → conflict
+            // same id, different body → conflict (409)
             return Err(BridgeError::conflict());
         }
         if handle.is_terminal() {
             // terminal: replay buffered frames as a fresh one-shot stream
             return Ok(crate::run::terminal_replay_response(handle));
         }
-        // active: re-attach — replay buffer then follow broadcast
+        // active: re-attach — replay buffer then follow broadcast. Do NOT
+        // call try_start_run: the slot is already held by this same run_id,
+        // and a fresh claim would 429 ourselves.
         return Ok(crate::run::sse_response(crate::run::forward_stream(handle)));
     }
 
-    // 6. New run: reserve the session slot (429 if a different run is busy).
-    state
+    // 6. New run: claim the session slot (429 if a different run is busy).
+    //    On contention, roll back the placeholder entry we just created via
+    //    `remove` (not `finish` — finishing would pin a never-spawned entry
+    //    for TERMINAL_GRACE and stall same-id retries behind a fake terminal
+    //    replay). The run_id is unique at this point (a colliding id would
+    //    have returned `is_new == false` above), so removing it cannot touch
+    //    another run's entry.
+    if state
         .sessions
         .try_start_run(&bot.provider_bot_ref, &session_id, &run_id)
         .await
-        .map_err(|_| BridgeError::rate_limited())?;
-
-    // 7. Atomic begin (handle re-attach race between get() and begin()).
-    let (handle, is_new) = state.runs.begin(&run_id, fp);
-    if is_new {
-        // Record the (provider_bot_ref, session_id) association so a later
-        // `chat.abort` (after this run terminates) can reverse-lookup its
-        // terminal run_id via RunRegistry::find_terminal_run — the 410 leg of
-        // the abort matrix.
-        state
-            .runs
-            .record_session(&run_id, &bot.provider_bot_ref, &session_id);
-        return Ok(crate::run::spawn_run(state, req, bot, session_id, handle));
+        .is_err()
+    {
+        state.runs.remove(&run_id);
+        return Err(BridgeError::rate_limited());
     }
-    // Lost the race: another concurrent same-id request won. Re-attach (do not
-    // spawn a duplicate driver). The slot we reserved is for the same run_id,
-    // so releasing it would wrongly clear the winner's reservation — leave it.
-    Ok(crate::run::sse_response(crate::run::forward_stream(handle)))
+
+    // 7. Record the (provider_bot_ref, session_id) association BEFORE spawning
+    //    the driver so a chat.abort landing in the (small) window between
+    //    claiming the slot and the driver taking flight can still resolve the
+    //    run — via the active leg if mid-flight, or via `find_terminal_run`
+    //    (410 leg) once the driver self-terminates.
+    state
+        .runs
+        .record_session(&run_id, &bot.provider_bot_ref, &session_id);
+    Ok(crate::run::spawn_run(state, req, bot, session_id, handle))
 }
 
 /// `interaction.resolve` ACK with a STRING error (spec §5.1 — this method does
@@ -421,9 +440,15 @@ async fn handle_chat_abort(
         return Ok((status, Json(body)).into_response());
     }
 
-    // Branch 3 — no active run, no terminal record (or the session store's
-    // active_run_id pointed at a registry entry already swept past grace):
-    // 200 aborted:false. BCS may retry/send a fresh request normally.
+    // Branch 3 — no active run and no terminal record: 200 aborted:false.
+    // The only sources of `active_run=Some` + `handle=None` used to be the
+    // startup TOCTOU between try_start_run and begin (chat.send now does
+    // begin-first, so the registry entry exists the moment active_run is
+    // set) and a run swept past grace after finish (impossible: the driver
+    // calls sessions.finish_run between runs.finish and the sweep's grace
+    // expiry, so active_run is cleared before the entry is reclaimable).
+    // Reaching here on a session the provider has never seen, or whose run
+    // finished long ago past grace — BCS may send a fresh request normally.
     let body = json!({
         "ok": true,
         "aborted": false,

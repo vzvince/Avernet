@@ -391,3 +391,75 @@ async fn abort_active_run_emits_aborted_terminal() {
     assert_eq!(none_body["aborted"], serde_json::json!(false));
     assert_eq!(none_body["aborted_run_ids"], serde_json::json!([]));
 }
+
+/// Regression test for the chat.send/abort startup TOCTOU (review fix round 1).
+///
+/// Invariant: the moment `sessions.active_run(bot, session)` is `Some(run_id)`,
+/// `RunRegistry::get(run_id)` MUST also be `Some`. The original bug reserved
+/// the session slot (`try_start_run`) BEFORE creating the registry entry
+/// (`begin`), leaving a window where a chat.abort could see
+/// `active_run=Some` + `runs.get=None` and wrongly return `{"aborted":false}`
+/// (matrix branch 3 instead of branch 1). The fix inverts the order in
+/// `handle_chat_send`: begin → try_start_run → (on 429) rollback.
+///
+/// Forces the window deterministically by polling AppState's `sessions` +
+/// `runs` directly while a slow-mock chat.send is in flight: the moment
+/// `active_run` flips to `Some`, `runs.get(rid)` must be `Some`. mock_cc_slow
+/// keeps the run alive long enough to reliably observe the transition. The
+/// `(url, state)` helper is what exposes AppState for this check.
+#[tokio::test]
+async fn chat_send_creates_run_entry_before_session_slot_claim() {
+    let (url, state) = support::spawn_app_with_mock_and_state("mock_cc_slow.sh", "cfuse-cc").await;
+    let client = reqwest::Client::new();
+    let send = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&serde_json::json!({"type":"req","id":"r-order","method":"chat.send",
+            "session_id":"s-order",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}));
+    // 后台持有 SSE 响应体（mock_cc_slow.sh 会读 stdin 后 sleep 30s）
+    let sse = tokio::spawn(async move { send.send().await.unwrap().text().await.unwrap() });
+
+    // 轮询 AppState：active_run 一旦变成 Some(r-order)，runs.get(r-order) 必须也是
+    // Some —— 这是 begin-first 不变量的直接断言。原 bug 在 try_start_run 与 begin
+    // 之间的窗口里该断言会失败（active_run=Some, runs.get=None）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut observed = false;
+    loop {
+        if let Some(rid) = state
+            .sessions
+            .active_run("worker-1", "s-order")
+            .await
+            .as_deref()
+        {
+            if rid == "r-order" {
+                assert!(
+                    state.runs.get(rid).is_some(),
+                    "TOCTOU regression: sessions.active_run=Some({rid}) but \
+                     RunRegistry::get returned None — abort landing now would \
+                     return aborted:false instead of aborted:true"
+                );
+                observed = true;
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        observed,
+        "active_run did not flip to Some(r-order) before the 2s deadline; \
+         the slow mock should keep the run in flight — rerun if flaky"
+    );
+
+    // Drain the SSE so the slow mock is reclaimed via kill_on_drop (aborted
+    // path cancels the engine, the test never waits the 30s sleep).
+    let _ = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"abort-order","method":"chat.abort",
+            "session_id":"s-order",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
+        .send().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sse).await;
+}

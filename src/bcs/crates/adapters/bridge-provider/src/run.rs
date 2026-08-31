@@ -235,6 +235,21 @@ impl RunRegistry {
         }
     }
 
+    /// Delete a run entry (and its `run_session` association), bypassing the
+    /// grace-TTL retention [`Self::finish`] relies on. Rollback-only: the
+    /// chat.send handler creates a placeholder entry via [`Self::begin`]
+    /// before claiming the session slot (`try_start_run`), so it can roll
+    /// back the placeholder on 429 (the session slot is held by a different
+    /// run_id) instead of leaving a dangling never-spawned entry pinned in
+    /// the registry for [`TERMINAL_GRACE`]. Removes from the main `map` then
+    /// `run_session.retain` (one upsert), so a stale session association is
+    /// never left pointing at a gone run_id.
+    pub fn remove(&self, run_id: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.map.remove(run_id);
+        inner.run_session.retain(|rid, _| rid != run_id);
+    }
+
     /// Record the `(provider_bot_ref, session_id)` association for `run_id`,
     /// enabling `chat.abort`'s [`Self::find_terminal_run`] reverse lookup.
     /// Called by `handle_chat_send` for a freshly-created run (right after
@@ -805,6 +820,26 @@ mod tests {
         // Unknown session and bot mismatch: no match.
         assert_eq!(reg.find_terminal_run("bot-1", "s-unknown"), None, "unknown session");
         assert_eq!(reg.find_terminal_run("bot-other", "s-1"), None, "bot mismatch");
+    }
+
+    #[test]
+    fn remove_drops_entry_and_run_session_association_for_rollback() {
+        // chat.send's 429 rollback path: the placeholder entry created by
+        // `begin` (and its record_session association, if any) must be wiped
+        // so the same run_id is not pinned in the registry and a same-id retry
+        // is not later surprised by a stale terminal-replay entry. `remove`
+        // bypasses the grace-TTL retention `finish` relies on.
+        let reg = RunRegistry::new();
+        let (_h, is_new) = reg.begin("r-roll", "fp".into());
+        assert!(is_new);
+        reg.record_session("r-roll", "bot-1", "s-1");
+        assert!(reg.get("r-roll").is_some());
+
+        reg.remove("r-roll");
+
+        assert!(reg.get("r-roll").is_none(), "entry removed by rollback");
+        assert_eq!(reg.find_terminal_run("bot-1", "s-1"), None,
+            "run_session association pruned alongside the entry");
     }
 
     #[tokio::test]
