@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use axum::{extract::State, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::post, Json, Router};
+use axum::{extract::State, http::HeaderMap, response::{IntoResponse, Response}, routing::post, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::{config::ProviderConfig, error::BridgeError};

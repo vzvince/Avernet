@@ -22,6 +22,7 @@ impl BridgeError {
     pub fn unsupported_method(m: &str) -> Self { Self::new(StatusCode::NOT_IMPLEMENTED, "unsupported_method", format!("method {m} is not supported"), false) }
     pub fn unavailable(m: impl Into<String>) -> Self { Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", m, true) }
     pub fn timeout() -> Self { Self::new(StatusCode::GATEWAY_TIMEOUT, "timeout", "dependency timed out", true) }
+    pub fn run_terminated() -> Self { Self::new(StatusCode::GONE, "run_terminated", "run is already terminal", false) }
 }
 
 impl IntoResponse for BridgeError {

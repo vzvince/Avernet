@@ -1,4 +1,4 @@
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use serde_json::json;
 
 mod support; // tests/support/mod.rs：spawn_app(config_toml: &str) -> String(base_url)
