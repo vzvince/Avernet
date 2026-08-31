@@ -136,3 +136,68 @@ fn interaction_requested_exec_roundtrips() {
         other => panic!("expected interaction, got {other:?}"),
     }
 }
+
+#[test]
+fn forbidden_event_kinds_are_rejected() {
+    // 每个变体走 event_to_frame 必须返回 FrameError::Unsupported：这是
+    // "禁止上线" 契约的直接断言（spec §2 旧 approval/phase 不得用于新接入；
+    // ping/unknown 由调用方过滤，不可当业务帧编码）。
+    use bcs_protocol::stream::{AgentData, AgentEvent, ApprovalData, ApprovalPhase, PhaseData};
+    use serde_json::Value;
+
+    fn assert_unsupported(ev: &StreamEvent) {
+        match event_to_frame(ev, 1, 1, "r") {
+            Err(FrameError::Unsupported) => {}
+            other => panic!("expected FrameError::Unsupported, got {other:?}"),
+        }
+    }
+
+    // ping 不是业务帧（调用方过滤），不可编码
+    let ping = StreamEvent::Ping { ts: None };
+    assert_unsupported(&ping);
+
+    // unknown 顶层事件不可编码
+    let unknown = StreamEvent::Unknown { event: "mystery".into(), raw: Value::Null };
+    assert_unsupported(&unknown);
+
+    // 旧 approval 结构禁止上线（spec：不能用于新接入）
+    let approval = StreamEvent::Agent(AgentEvent {
+        run_id: "r".into(),
+        seq: None,
+        ts: None,
+        session_key: None,
+        data: AgentData::Approval(ApprovalData {
+            phase: ApprovalPhase::Requested,
+            kind: Some("exec".into()),
+            status: None,
+            approval_id: None,
+            tool_call_id: None,
+            questions: None,
+            answers: None,
+        }),
+        raw: Value::Null,
+    });
+    assert_unsupported(&approval);
+
+    // Phase 暂不发
+    let phase = StreamEvent::Agent(AgentEvent {
+        run_id: "r".into(),
+        seq: None,
+        ts: None,
+        session_key: None,
+        data: AgentData::Phase(PhaseData { from_phase: None, to_phase: None }),
+        raw: Value::Null,
+    });
+    assert_unsupported(&phase);
+
+    // agent unknown stream 不可编码
+    let agent_unknown = StreamEvent::Agent(AgentEvent {
+        run_id: "r".into(),
+        seq: None,
+        ts: None,
+        session_key: None,
+        data: AgentData::Unknown { stream: "bogus".into(), raw: Value::Null },
+        raw: Value::Null,
+    });
+    assert_unsupported(&agent_unknown);
+}
