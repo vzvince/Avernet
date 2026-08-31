@@ -1,7 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
-use bridge_provider::{config::ProviderConfig, webhook};
+use bridge_provider::{config::ProviderConfig, webhook, AppState};
 
 pub async fn spawn_app(toml_text: &str) -> String {
+    spawn_app_with_state(toml_text).await.0
+}
+
+/// 与 [`spawn_app`] 同样起服务，但额外返回共享的 [`AppState`] 句柄，供测试
+/// 直接编排会话状态（例如预置 `engine_session_id`、排空 `pending_injects`）。
+pub async fn spawn_app_with_state(toml_text: &str) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bridge.toml");
     std::fs::write(&path, toml_text).unwrap();
@@ -10,11 +16,12 @@ pub async fn spawn_app(toml_text: &str) -> String {
     std::mem::forget(dir);
     let mut cfg = config;
     cfg.listen = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let app = webhook::router(Arc::new(bridge_provider::AppState::new(cfg)));
+    let state = Arc::new(AppState::new(cfg));
+    let app = webhook::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    (format!("http://{addr}"), state)
 }
 
 /// 用指定 mock 脚本作为 cfuse binary 起服务（engine 由参数选择 cc/codex 语义）。
@@ -22,8 +29,13 @@ pub async fn spawn_app(toml_text: &str) -> String {
 /// 单 bot `worker-1`，cfuse_bin 指向 `tests/fixtures/{script}`；两个端到端
 /// 测试都经此构造，避免真实 LLM 调用。
 pub async fn spawn_app_with_mock(script: &str, engine: &str) -> String {
+    spawn_app_with_mock_and_state(script, engine).await.0
+}
+
+/// [`spawn_app_with_mock`] 的 state-暴露版本：额外返回共享 [`AppState`]。
+pub async fn spawn_app_with_mock_and_state(script: &str, engine: &str) -> (String, Arc<AppState>) {
     let bin = format!("{}/tests/fixtures/{script}", env!("CARGO_MANIFEST_DIR"));
-    spawn_app(&format!(
+    spawn_app_with_state(&format!(
         r#"
 provider_id = "bridge-1"
 listen = "127.0.0.1:0"
