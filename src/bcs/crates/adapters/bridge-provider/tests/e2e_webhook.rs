@@ -537,3 +537,151 @@ cwd = "/tmp"
     .unwrap();
     assert!(status.success(), "graceful shutdown should yield exit 0, got {status}");
 }
+
+/// Task 16 — protocol regression: idempotent re-attach path (spec §5/§6).
+///
+/// `mock_cc_slow.sh` keeps the first chat.send run in-flight (sleep 30s before
+/// emitting any frames), so a same-id, same-body retry hits the active re-attach
+/// path (`RunRegistry::begin` returns `is_new == false` with a matching
+/// fingerprint) — not 429 (`try_start_run` is not re-invoked) and not 409 (body
+/// matches). The re-attached stream replays buffered frames then follows the
+/// broadcast; at re-attach time the slow mock has not pushed any frames yet,
+/// so the first seq frame the second stream observes is the abort's terminal
+/// `chat_aborted` frame (seq=1).
+///
+/// Deviation from the brief's literal `second.text().await` + `drop(first)`
+/// shape: the slow mock's 30s sleep would block `second.text()` for 30s. Per
+/// the brief's own note ("测试结束不能真的等 30s"), we send `chat.abort` after
+/// asserting the 200 re-attach to trigger a terminal frame promptly — the
+/// aborted frame carries seq=1, verifying the re-attached stream starts from
+/// the beginning. `kill_on_drop` reclaims the engine subprocess on test exit.
+#[tokio::test]
+async fn duplicate_send_reattaches_with_replay() {
+    let url = support::spawn_app_with_mock("mock_cc_slow.sh", "cfuse-cc").await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"type":"req","id":"run-dup","method":"chat.send",
+        "session_id":"s-1",
+        "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+        "message":{"role":"user","content":[{"type":"text","text":"hi"}]}});
+
+    let _first = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 同 id 同 body 重发 → 200 重挂（不是 429，不是 409）
+    let second = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
+    assert_eq!(second.status(), 200);
+
+    // Abort the run to trigger a terminal frame promptly (the slow mock would
+    // otherwise block 30s). The aborted frame carries seq=1 — the re-attached
+    // stream's first seq frame starts at 1 (replay buffer + broadcast both
+    // partition from the beginning of the run's frame history).
+    let _ = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"abort-dup","method":"chat.abort",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
+        .send().await;
+
+    let second_text = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        second.text(),
+    ).await.expect("second stream drains within 5s after abort").unwrap();
+    let seqs = support::extract_seqs(&second_text);
+    assert_eq!(seqs.first(), Some(&1), "re-attached stream starts from seq 1: {second_text}");
+    assert!(second_text.contains("\"state\":\"aborted\""), "aborted terminal: {second_text}");
+}
+
+/// Task 16 — protocol regression: same id, different body → 409 conflict
+/// (spec §5). `RunRegistry::begin` returns the existing handle with
+/// `matches(fp) == false`, so the handler renders `BridgeError::conflict()`.
+/// The slow mock keeps the first run active while the conflicting retry
+/// arrives; `kill_on_drop` reclaims the engine subprocess on test exit.
+#[tokio::test]
+async fn same_id_different_body_conflicts() {
+    let url = support::spawn_app_with_mock("mock_cc_slow.sh", "cfuse-cc").await;
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({"type":"req","id":"run-x","method":"chat.send",
+        "session_id":"s-1",
+        "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+        "message":{"role":"user","content":[{"type":"text","text":"hi"}]}});
+    let _first = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
+    body["message"]["content"][0]["text"] = serde_json::json!("changed");
+    let second = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
+    assert_eq!(second.status(), 409);
+    let err: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(err["error"]["code"], serde_json::json!("conflict"));
+}
+
+/// Task 16 — protocol regression: missing `X-BCN-Protocol-Version: 2.0`
+/// header → 400 (spec §5). `handle_chat_send` is the only method that gates on
+/// this header; a chat.send without it short-circuits to
+/// `BridgeError::invalid_request` after token/provider_id checks pass.
+#[tokio::test]
+async fn missing_protocol_2_header_rejected() {
+    let url = support::spawn_app_with_mock("mock_cc.sh", "cfuse-cc").await;
+    let resp = reqwest::Client::new().post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"r","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], serde_json::json!("invalid_request"));
+}
+
+/// Task 16 — protocol regression: UTF-8 deltas stay intact end-to-end (spec
+/// §5/§6). `mock_cc_utf8.sh` emits 40 Chinese `text_delta` lines then a
+/// terminal result. `reqwest` `resp.text()` requires the whole body to be
+/// valid UTF-8 (a half-character byte slice anywhere would fail); additionally
+/// every `data:` line must parse as JSON — the SSE encoder and the cc driver's
+/// NDJSON reader must never slice multi-byte sequences.
+#[tokio::test]
+async fn utf8_chinese_deltas_stay_intact() {
+    // mock_cc_utf8.sh：逐行吐 40 条中文 delta（每条一个完整 JSON 事件行）
+    let url = support::spawn_app_with_mock("mock_cc_utf8.sh", "cfuse-cc").await;
+    let resp = reqwest::Client::new().post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&serde_json::json!({"type":"req","id":"run-u","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+        .send().await.unwrap();
+    let text = resp.text().await.unwrap();  // text() 要求全程合法 UTF-8
+    assert!(text.contains("中文增量"), "missing Chinese delta: {text}");
+    // 每个 data 行都是合法 JSON（无半个字符截断）
+    for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        serde_json::from_str::<serde_json::Value>(line).expect("valid json frame");
+    }
+    // 40 条 delta 均应在流中（progress check beyond the contains needle）
+    let delta_count = text.lines().filter(|l| l.contains("\"deltaText\":\"中文增量\"")).count();
+    assert_eq!(delta_count, 40, "expected 40 Chinese deltas, found {delta_count}: {text}");
+}
+
+/// Task 16 — protocol regression: an oversize single frame becomes a terminal
+/// `chat/error`, never an oversize emission (spec §5/§7). `mock_cc_big.sh`
+/// emits one `text_delta` with 9,000,000 chars of padding (~9 MiB JSON frame),
+/// exceeding `MAX_FRAME_BYTES` (8 MiB). The run loop's `push_frame` catches
+/// `FrameError::FrameTooLarge`, emits a bounded `chat_error` terminal instead,
+/// and signals termination — no oversize frame reaches the wire.
+#[tokio::test]
+async fn oversize_single_frame_becomes_chat_error() {
+    // mock_cc_big.sh：吐一条 >8MiB 的 text_delta
+    let url = support::spawn_app_with_mock("mock_cc_big.sh", "cfuse-cc").await;
+    let resp = reqwest::Client::new().post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&serde_json::json!({"type":"req","id":"run-big","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+        .send().await.unwrap();
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("\"state\":\"error\""), "超限 → error 终态: {text}");
+    assert!(!text.contains("\"state\":\"final\""), "error path must not also emit final: {text}");
+    assert!(text.len() < 9 * 1024 * 1024, "没有超限帧被发出: {}", text.len());
+    // The error frame carries the "frame too large" diagnostic from push_frame.
+    assert!(text.contains("\"errorMessage\":\"frame too large\""), "error cause: {text}");
+}
