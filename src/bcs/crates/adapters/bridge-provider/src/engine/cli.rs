@@ -4,7 +4,7 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub struct CliSession {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<tokio::process::ChildStdout>,
 }
 
@@ -45,15 +45,29 @@ impl CliSession {
         });
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
         })
     }
 
     pub async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io_err("stdin already closed"))?;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
+    }
+
+    /// Close the child's stdin pipe by dropping the handle.
+    ///
+    /// `codex exec` reads a piped stdin as additional input; when the prompt is
+    /// passed as an argv positional (the codex path), stdin must be closed
+    /// immediately after spawn so the child sees EOF and proceeds with the argv
+    /// prompt only — instead of blocking on, or consuming, stdin.
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 
     pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
@@ -63,38 +77,6 @@ impl CliSession {
             return Ok(None);
         }
         Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
-    }
-
-    /// 读取一个 SSE 块（`event:`/`data:` 行聚合到空行），返回 `(event, data)`。
-    ///
-    /// 多行 `data:` 按 SSE 规范用 `\n` 拼接；`event:` 取最后一次出现的值。
-    /// EOF 且无残留（`saw_any == false`）→ `Ok(None)`；EOF 时仍有未分隔块 →
-    /// 返回该部分块（`\n` 终结符丢失不丢已读内容）。空行作为块分隔符。
-    pub async fn next_sse_block(&mut self) -> std::io::Result<Option<(String, String)>> {
-        let mut event = String::new();
-        let mut data_lines: Vec<String> = Vec::new();
-        let mut saw_any = false;
-        loop {
-            match self.next_line().await? {
-                None => return Ok(saw_any.then(|| (event, data_lines.join("\n")))),
-                Some(line) if line.is_empty() => {
-                    return Ok(if saw_any {
-                        Some((event, data_lines.join("\n")))
-                    } else {
-                        None
-                    });
-                }
-                Some(line) => {
-                    saw_any = true;
-                    if let Some(v) = line.strip_prefix("event: ") {
-                        event = v.to_string();
-                    }
-                    if let Some(v) = line.strip_prefix("data: ") {
-                        data_lines.push(v.to_string());
-                    }
-                }
-            }
-        }
     }
 
     pub async fn kill(&mut self) {
@@ -131,8 +113,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_session_next_sse_block_parses_blocks_until_eof() {
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_sse.sh");
+    async fn cli_session_close_stdin_blocks_further_writes() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_engine.sh");
         let mut cli = CliSession::spawn(
             Path::new("bash"),
             &[script.to_string()],
@@ -141,18 +123,9 @@ mod tests {
         )
         .await
         .unwrap();
-        cli.write_line("go").await.unwrap();
-
-        let (event, data) = cli.next_sse_block().await.unwrap().unwrap();
-        assert_eq!(event, "response.output_text.delta");
-        assert_eq!(data, r#"{"type":"response.output_text.delta","delta":"hi"}"#);
-
-        let (event, data) = cli.next_sse_block().await.unwrap().unwrap();
-        assert_eq!(event, "response.completed");
-        assert_eq!(data, r#"{"type":"response.completed"}"#);
-
-        // EOF after the final blank line → None（无残留块）。
-        assert!(cli.next_sse_block().await.unwrap().is_none());
+        cli.close_stdin();
+        let err = cli.write_line("late").await.expect_err("write after close must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         cli.kill().await;
     }
 }
