@@ -1500,6 +1500,8 @@ codex 输出为 SSE 帧（`event:/data:` 空行分隔），CliSession 需按块�
 
 **实现前置调研步骤（必做）**：读 `~/workspace/aix-engine-workspace/crates/relay/src/runtime/codefuse_codex.rs` 的 spawn 参数构造与会话 resume 方式（搜索 `Command`/`resume`/`session`），把真实 cfuse codex 调用参数与本驱动对齐；若 cfuse codex 模式不支持 `--resume` 等价物，则 `engine_session_id` 恒为 `None` 并在代码注释注明限制（spec 允许：会话上下文由引擎 transcript 保证的前提不成立时，回退为"每次新会话 + pending injects 前置"）。
 
+> **执行期修正（controller ruling，已实测验证）**：`cfuse --codex` 是 codex CLI 透传；真实输出形态是 `codex exec --json` 的 **JSONL**（`thread.started`/`turn.started`/`item.completed{agent_message,reasoning}`/`turn.completed`），**不是** SSE。resume 用 `codex exec resume <thread_id> [prompt]`（engine session id = thread_id）。映射：`thread.started`→SessionId；`agent_message`→chat_delta；`reasoning`→agent_thinking；`turn.completed`→Final（累计文本）；`turn.failed`/`error`→Failed。上方 SSE 映射表与 fixture 形态以本修正为准。
+
 - [ ] **Step 1: 录制 fixture + 写失败测试**
 
 `tests/fixtures/codex_turn.sse`：
@@ -2071,13 +2073,16 @@ async fn inject_then_send_prepends_for_codex() {
 }
 ```
 
-`mock_codex.sh`（回显 prompt 的 codex 假引擎）：
+`mock_codex.sh`（回显 prompt 的 codex 假引擎）——注意：**执行期修正后 codex 输出是 JSONL**（`codex exec --json` 形态），不是 SSE：
 
 ```bash
 #!/usr/bin/env bash
 prompt="$*"
-printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"%s"}\n\n' "$prompt"
-printf 'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+printf '{"type":"thread.started","thread_id":"mock-thread-1"}\n'
+printf '{"type":"turn.started"}\n'
+# prompt 里的双引号/反斜杠需转义后再嵌入 JSON；mock 场景的 prompt 不含特殊字符，直接拼接
+printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"%s"}}\n' "$prompt"
+printf '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
 ```
 
 - [ ] **Step 2: 运行确认失败**
