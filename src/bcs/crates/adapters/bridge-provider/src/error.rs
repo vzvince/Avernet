@@ -27,9 +27,23 @@ impl BridgeError {
 
 impl IntoResponse for BridgeError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({
+        let (status, body) = self.into_parts();
+        (status, Json(body)).into_response()
+    }
+}
+
+impl BridgeError {
+    /// Render this error as `(StatusCode, body Value)` — the same shape
+    /// [`IntoResponse`] produces, but split out so a caller can (a) store the
+    /// body in the idempotency ledger via `complete_with_status` and (b) return
+    /// the exact same status+body as the original response on a same-id retry.
+    /// Used by `chat.abort`'s 410 `run_terminated` path so ledger replay returns
+    /// 410 (not the default in-flight 200 ack).
+    pub fn into_parts(self) -> (StatusCode, serde_json::Value) {
+        let body = json!({
             "ok": false,
             "error": { "code": self.code, "message": self.message, "retryable": self.retryable }
-        }))).into_response()
+        });
+        (self.status, body)
     }
 }

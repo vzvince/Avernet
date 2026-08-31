@@ -333,3 +333,61 @@ async fn inject_sinks_to_cc_transcript_and_does_not_pending() {
     let lines2: Vec<&str> = content2.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines2.len(), 1, "idempotent replay appended a second line: {content2}");
 }
+
+/// Task 14 — chat.abort terminal-state matrix:
+/// - Active run present: 200 `{ok, aborted:true, aborted_run_ids:[run_id]}`; the
+///   SSE stream for the aborted chat.send must emit a terminal `state=aborted`
+///   frame (the 200 abort ACK does not wait for the engine to die — coordination
+///   is via the run loop, which the test asserts by reading the SSE body).
+/// - Repeating abort on the same now-terminal run: 410 `run_terminated` (stable;
+///   the run→session reverse index on RunRegistry remembers the terminal run).
+/// - Unknown session: 200 `{ok, aborted:false, aborted_run_ids:[]}`.
+#[tokio::test]
+async fn abort_active_run_emits_aborted_terminal() {
+    let url = support::spawn_app_with_mock("mock_cc_slow.sh", "cfuse-cc").await;
+    let client = reqwest::Client::new();
+    let send = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&serde_json::json!({"type":"req","id":"run-1","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"慢任务"}]}}));
+    // 后台持有 SSE 响应体
+    let sse = tokio::spawn(async move { send.send().await.unwrap().text().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await; // 等 run 起跑
+
+    let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"abort-1","method":"chat.abort",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
+        .send().await.unwrap();
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], serde_json::json!(true));
+    assert_eq!(body["aborted"], serde_json::json!(true));
+    assert_eq!(body["aborted_run_ids"], serde_json::json!(["run-1"]));
+
+    let sse_text = tokio::time::timeout(std::time::Duration::from_secs(5), sse).await.unwrap().unwrap();
+    assert!(sse_text.contains("\"state\":\"aborted\""));
+
+    // 对同一 terminal run 重复 abort → 410 run_terminated（稳定）
+    let again = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"abort-2","method":"chat.abort",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
+        .send().await.unwrap();
+    assert_eq!(again.status(), 410);
+    assert_eq!(again.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+               serde_json::json!("run_terminated"));
+
+    // 无任何记录的 session → aborted:false
+    let none = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&serde_json::json!({"type":"req","id":"abort-3","method":"chat.abort",
+            "session_id":"s-unknown",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
+        .send().await.unwrap();
+    let none_body: serde_json::Value = none.json().await.unwrap();
+    assert_eq!(none_body["aborted"], serde_json::json!(false));
+    assert_eq!(none_body["aborted_run_ids"], serde_json::json!([]));
+}

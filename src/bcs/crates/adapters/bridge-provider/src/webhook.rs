@@ -78,10 +78,7 @@ async fn dispatch(
         // own branch so it never reaches the shared error renderer.
         "interaction.resolve" => Ok(handle_interaction_resolve(state, req).await),
         "chat.inject" => handle_chat_inject(state, req).await,
-        "chat.abort" => {
-            // Task 14 implements chat.abort; unavailable here.
-            Err(BridgeError::unavailable("not yet implemented"))
-        }
+        "chat.abort" => handle_chat_abort(state, req).await,
         other => Err(BridgeError::unsupported_method(other)),
     }
 }
@@ -142,6 +139,13 @@ async fn handle_chat_send(
     // 7. Atomic begin (handle re-attach race between get() and begin()).
     let (handle, is_new) = state.runs.begin(&run_id, fp);
     if is_new {
+        // Record the (provider_bot_ref, session_id) association so a later
+        // `chat.abort` (after this run terminates) can reverse-lookup its
+        // terminal run_id via RunRegistry::find_terminal_run — the 410 leg of
+        // the abort matrix.
+        state
+            .runs
+            .record_session(&run_id, &bot.provider_bot_ref, &session_id);
         return Ok(crate::run::spawn_run(state, req, bot, session_id, handle));
     }
     // Lost the race: another concurrent same-id request won. Re-attach (do not
@@ -249,7 +253,7 @@ async fn handle_chat_inject(
     let run_id = req.id.clone();
     match state.idem.begin(&run_id, &fp) {
         IdemDecision::Proceed => {}
-        IdemDecision::Replay(v) => return Ok(Json(v).into_response()),
+        IdemDecision::Replay { status, body } => return Ok((status, Json(body)).into_response()),
         IdemDecision::Conflict => return Err(BridgeError::conflict()),
     }
 
@@ -305,4 +309,128 @@ async fn handle_chat_inject(
     let resp = json!({ "ok": true });
     state.idem.complete(&run_id, resp.clone());
     Ok(Json(resp).into_response())
+}
+
+/// Handle `chat.abort` (Task 14, spec §5.3): cancel the active run for the
+/// session (if any), emit a terminal `chat_aborted` SSE frame on that run's
+/// stream (driven by the run loop, which sees the abort flag and surfaces the
+/// final state), and respond per the abort matrix. The 200 abort ACK does NOT
+/// wait for the engine to die — the run loop's post-cancel finalize drains it
+/// asynchronously (the BCS x-PC observes the `state=aborted` frame on the
+/// chat.send SSE stream, not a flushed abort ACK).
+///
+/// Response matrix (spec §5.3):
+/// - Active run for the session: invalidate its parked HITL interactions with
+///   the deny fallback (so the driver never blocks on a dead receiver), call
+///   its `request_abort()` (sets the abort flag + cancels the token + records
+///   the `user_cancelled` stop_reason for the terminal `chat_aborted` SSE
+///   frame), then 200 `{"ok":true,"aborted":true,"aborted_run_ids":[<run_id>]}`.
+/// - No active run, but a terminal run recorded for this session in
+///   `RunRegistry`'s `run_session` reverse index: 410 `run_terminated` —
+///   repeating abort on the same terminal run stably returns 410.
+/// - No record at all (and the edge case where the session store claims an
+///   active run_id that the registry has already swept): 200
+///   `{"ok":true,"aborted":false,"aborted_run_ids":[]}`.
+///
+/// Passes through the idempotency ledger (Task 5) with fingerprint
+/// `method + provider_bot_ref + session_id` (no message body — abort has
+/// none). Replays the prior status+body verbatim (via
+/// [`IdempotencyLedger::complete_with_status`], including 410s) so a same-id
+/// retry of any branch returns the exact same response — the brief's
+/// "对同 terminal run 重复 abort 稳定同答；幂等台账保证同 id 重放".
+async fn handle_chat_abort(
+    state: Arc<AppState>,
+    req: DownstreamRequest,
+) -> Result<Response, BridgeError> {
+    // 1. session_id required
+    let session_id = req
+        .session_id
+        .as_ref()
+        .ok_or_else(|| BridgeError::invalid_request("session_id required"))?
+        .clone();
+    // 2. bot exists
+    let bot = state
+        .config
+        .bot(&req.to_bot.provider_bot_ref)
+        .ok_or_else(|| BridgeError::bot_not_found(&req.to_bot.provider_bot_ref))?
+        .clone();
+
+    // 3. Idempotency: fingerprint = method + provider_bot_ref + session_id
+    //    (no message — abort carries none). Same shape as `chat.inject` minus
+    //    the body.
+    let fp = crate::idempotency::fingerprint(&[
+        "chat.abort",
+        &req.to_bot.provider_bot_ref,
+        &session_id,
+    ]);
+    let run_id = req.id.clone();
+    match state.idem.begin(&run_id, &fp) {
+        IdemDecision::Proceed => {}
+        IdemDecision::Replay { status, body } => {
+            return Ok((status, Json(body)).into_response())
+        }
+        IdemDecision::Conflict => return Err(BridgeError::conflict()),
+    }
+
+    // 4. Matrix. Resolve the active run's handle up-front so the active branch
+    //    is a single atomic invalidate+request_abort against the same handle
+    //    (no TOCTOU between re-reading sessions.active_run and runs.get).
+    let active_run_id = state
+        .sessions
+        .active_run(&bot.provider_bot_ref, &session_id)
+        .await;
+    let active_handle = active_run_id
+        .as_deref()
+        .and_then(|rid| state.runs.get(rid));
+
+    // Branch 1 — active run: invalidate + request_abort → 200 aborted:true.
+    if let (Some(run_id_active), Some(handle)) = (active_run_id.as_deref(), active_handle) {
+        // Invalidate BEFORE the engine kill (spec §6.3): the resolution channel
+        // delivers the deny fallback rather than a dropped-receiver error. The
+        // run loop's finalize calls invalidate_run again — idempotent, so the
+        // second call's resolver-clear is a no-op.
+        state
+            .interactions
+            .invalidate_run(run_id_active, json!({ "decision": "deny" }));
+        // request_abort: set abort_requested (→ run loop emits chat_aborted),
+        // store "user_cancelled" as the SSE frame's stopReason, cancel the
+        // engine's CancellationToken (the driver's select! arm fires, kills
+        // the cli, returns TurnError::Aborted).
+        handle.request_abort("user_cancelled");
+        let body = json!({
+            "ok": true,
+            "aborted": true,
+            "aborted_run_ids": [run_id_active],
+        });
+        state
+            .idem
+            .complete_with_status(&run_id, axum::http::StatusCode::OK, body.clone());
+        return Ok((axum::http::StatusCode::OK, Json(body)).into_response());
+    }
+
+    // Branch 2 — terminal run recorded for this session → 410 run_terminated.
+    if state
+        .runs
+        .find_terminal_run(&bot.provider_bot_ref, &session_id)
+        .is_some()
+    {
+        let (status, body) = BridgeError::run_terminated().into_parts();
+        state
+            .idem
+            .complete_with_status(&run_id, status, body.clone());
+        return Ok((status, Json(body)).into_response());
+    }
+
+    // Branch 3 — no active run, no terminal record (or the session store's
+    // active_run_id pointed at a registry entry already swept past grace):
+    // 200 aborted:false. BCS may retry/send a fresh request normally.
+    let body = json!({
+        "ok": true,
+        "aborted": false,
+        "aborted_run_ids": [],
+    });
+    state
+        .idem
+        .complete_with_status(&run_id, axum::http::StatusCode::OK, body.clone());
+    Ok((axum::http::StatusCode::OK, Json(body)).into_response())
 }

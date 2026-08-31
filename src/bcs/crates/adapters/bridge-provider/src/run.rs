@@ -71,6 +71,12 @@ enum PushOutcome {
 /// This is what keeps the replay-buffer-then-follow-broadcast forward path free
 /// of duplicate or lost frames.
 ///
+/// `abort_requested` distinguishes an explicit abort (chat.abort or graceful
+/// shutdown) from a passive BCS disconnect. The run loop emits a terminal
+/// `chat_aborted` frame only when it is set, so a disconnect closes the stream
+/// silently while chat.abort surfaces a final `state=aborted` frame to the BCS
+/// SSE consumer (spec §5.3).
+///
 /// All fields are `Arc`/clone-cheap so a [`RunHandle`] is cheaply cloneable for
 /// the driver task and each re-attach forwarder.
 #[derive(Clone)]
@@ -79,6 +85,12 @@ pub struct RunHandle {
     pub tx: broadcast::Sender<String>,
     pub buffer: Arc<Mutex<Vec<String>>>,
     pub terminal: Arc<AtomicBool>,
+    abort_requested: Arc<AtomicBool>,
+    /// `stopReason` to surface in the terminal `chat_aborted` SSE frame. Set by
+    /// the abort requester via [`Self::request_abort`]; stays at the default
+    /// `"user_cancelled"` until then. `std::sync::Mutex` (short critical section,
+    /// never held across an `.await`) so a poison is recoverable.
+    abort_reason: Arc<Mutex<String>>,
     fp: Arc<String>,
 }
 
@@ -92,11 +104,51 @@ impl RunHandle {
     pub fn is_terminal(&self) -> bool {
         self.terminal.load(Ordering::SeqCst)
     }
+
+    /// True iff an explicit abort has been requested via [`Self::request_abort`]
+    /// (chat.abort or graceful shutdown). The run loop emits a terminal
+    /// `chat_aborted` frame only when this is set; a passive BCS disconnect
+    /// (broadcast send returns no subscribers) does not set it, so its run
+    /// closes silently — the stream just ends.
+    pub fn is_abort_requested(&self) -> bool {
+        self.abort_requested.load(Ordering::SeqCst)
+    }
+
+    /// The `stopReason` to surface in the terminal `chat_aborted` SSE frame —
+    /// whatever the most recent [`Self::request_abort`] caller set, defaulting
+    /// to `"user_cancelled"` until then. Mutex poison is recovered (consistent
+    /// with the rest of this crate) so a panicking holder never wedges the run.
+    pub fn abort_stop_reason(&self) -> String {
+        self.abort_reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Mark this run explicitly aborted: set the requested flag (so the run
+    /// loop emits a `chat_aborted` terminal frame when the engine returns
+    /// `TurnError::Aborted`), record `reason` as the SSE frame's `stopReason`,
+    /// and cancel the token (the driver's `select!` arm fires, killing the
+    /// engine). Idempotent — safe to call repeatedly (a chat.abort racing a
+    /// graceful shutdown, or a duplicate abort, all collapse to one abort).
+    pub fn request_abort(&self, reason: &str) {
+        self.abort_requested.store(true, Ordering::SeqCst);
+        *self.abort_reason.lock().unwrap_or_else(|p| p.into_inner()) = reason.to_string();
+        self.abort.cancel();
+    }
 }
 
 struct RunEntry {
     handle: RunHandle,
     finished_at: Option<Instant>,
+}
+
+/// Inner state guarded by the registry's single mutex: the forward run map
+/// plus the `run_session` reverse index (run_id → (provider_bot_ref,
+/// bcs_session_id)). Both are mutated under one lock so the lazy grace-TTL
+/// sweep reclaims them atomically — `chat.abort`'s `find_terminal_run` never
+/// observes a run_session entry whose run was already swept (and vice versa).
+#[derive(Default)]
+struct RunRegistryInner {
+    map: HashMap<String, RunEntry>,
+    run_session: HashMap<String, (String, String)>,
 }
 
 /// Registry of in-flight and recently-terminal runs, keyed by downstream body id.
@@ -105,9 +157,17 @@ struct RunEntry {
 /// returns the existing handle for the same id (`is_new == false`). `get` reads
 /// an existing handle without inserting. `finish` marks a run terminal and stamps
 /// `finished_at` so the lazy sweep can reclaim it after [`TERMINAL_GRACE`].
+///
+/// `chat.abort` (Task 14) drives off two lookup paths:
+/// - [`Self::get`] returns the active run's handle (so the abort handler can
+///   cancel its token + invalidate its interactions).
+/// - [`Self::find_terminal_run`] reverse-looks-up via the `run_session` index:
+///   given `(provider_bot_ref, session_id)` it answers "is there a terminal run
+///   recorded for this pair?" — the second leg of the abort response matrix
+///   (terminal run → 410 `run_terminated`; no record → 200 `{"aborted": false}`).
 #[derive(Default)]
 pub struct RunRegistry {
-    map: Mutex<HashMap<String, RunEntry>>,
+    inner: Mutex<RunRegistryInner>,
 }
 
 impl RunRegistry {
@@ -115,22 +175,27 @@ impl RunRegistry {
         Self::default()
     }
 
-    fn sweep_locked(map: &mut HashMap<String, RunEntry>) {
+    fn sweep_locked(inner: &mut RunRegistryInner) {
         let now = Instant::now();
-        map.retain(|_, e| {
+        // Retain terminal entries within grace; always retain active.
+        inner.map.retain(|_, e| {
             match e.finished_at {
                 Some(t) => now.saturating_duration_since(t) < TERMINAL_GRACE,
                 None => true,
             }
         });
+        // Drop run_session entries whose runs were swept (the run no longer
+        // lives in the map — the (bot, session) pair is no longer resolvable
+        // by run id, so `find_terminal_run` must stop reporting it).
+        inner.run_session.retain(|run_id, _| inner.map.contains_key(run_id));
     }
 
     /// Returns the existing handle for `run_id` (active or terminal), if any.
     /// Performs a lazy grace-TTL sweep of terminal entries.
     pub fn get(&self, run_id: &str) -> Option<RunHandle> {
-        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        Self::sweep_locked(&mut map);
-        map.get(run_id).map(|e| e.handle.clone())
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_locked(&mut inner);
+        inner.map.get(run_id).map(|e| e.handle.clone())
     }
 
     /// Create a new run, or — if `run_id` already exists — return the existing
@@ -138,9 +203,9 @@ impl RunRegistry {
     /// marks "same id already present" (re-attach / terminal-replay / conflict
     /// decision belongs to the caller, which compares [`RunHandle::matches`]).
     pub fn begin(&self, run_id: &str, fingerprint: String) -> (RunHandle, bool) {
-        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        Self::sweep_locked(&mut map);
-        if let Some(entry) = map.get(run_id) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_locked(&mut inner);
+        if let Some(entry) = inner.map.get(run_id) {
             return (entry.handle.clone(), false);
         }
         let (tx, _rx) = broadcast::channel::<String>(256);
@@ -149,9 +214,11 @@ impl RunRegistry {
             tx,
             buffer: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(AtomicBool::new(false)),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_reason: Arc::new(Mutex::new("user_cancelled".to_string())),
             fp: Arc::new(fingerprint),
         };
-        map.insert(
+        inner.map.insert(
             run_id.to_string(),
             RunEntry { handle: handle.clone(), finished_at: None },
         );
@@ -161,10 +228,70 @@ impl RunRegistry {
     /// Mark `run_id` terminal. Buffered frames are retained for [`TERMINAL_GRACE`]
     /// so a late re-send can replay the terminal state; lazy sweep reclaims them.
     pub fn finish(&self, run_id: &str) {
-        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = map.get_mut(run_id) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = inner.map.get_mut(run_id) {
             entry.handle.terminal.store(true, Ordering::SeqCst);
             entry.finished_at = Some(Instant::now());
+        }
+    }
+
+    /// Record the `(provider_bot_ref, session_id)` association for `run_id`,
+    /// enabling `chat.abort`'s [`Self::find_terminal_run`] reverse lookup.
+    /// Called by `handle_chat_send` for a freshly-created run (right after
+    /// [`Self::begin`] returns `is_new == true`). Idempotent on the same
+    /// run_id — overwrites any stale association; stale entries are pruned
+    /// by the grace-TTL sweep ([`Self::sweep_locked`]) once the run itself is
+    /// swept.
+    pub fn record_session(&self, run_id: &str, bot: &str, session: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner
+            .run_session
+            .insert(run_id.to_string(), (bot.to_string(), session.to_string()));
+    }
+
+    /// Find a terminal run for `(bot, session)`, returning its run_id. Used by
+    /// `chat.abort` to distinguish "no active run, but a terminal run was
+    /// recorded for this session" (return 410 `run_terminated`) from "no record
+    /// at all" (return 200 `{"aborted": false}`). Iterates the run_session
+    /// reverse index and checks each candidate's `terminal` flag in the run
+    /// map. There is at most one terminal run per session in practice: a fresh
+    /// run cannot start while another is active (the session slot's 429 guard
+    /// excludes it), so successive terminal runs for one session never overlap.
+    pub fn find_terminal_run(&self, bot: &str, session: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_locked(&mut inner);
+        inner
+            .run_session
+            .iter()
+            .find(|(run_id, (b, s))| {
+                b == bot && s == session
+                    && inner.map.get(*run_id).map_or(false, |e| e.handle.is_terminal())
+            })
+            .map(|(run_id, _)| run_id.clone())
+    }
+
+    /// Abort every still-active run by calling [`RunHandle::request_abort`] with
+    /// `reason` on each. Used by the provider's graceful shutdown path (Task 15):
+    /// iterating in-flight runs and cancelling them lets each run loop finalize
+    /// (engine killed, interactions invalidated, session slot released) instead
+    /// of leaving orphaned drivers when the process exits. Terminal runs are
+    /// skipped — they are already closing. The mutex is released before calling
+    /// `request_abort` so the per-run cancellation (which writes the engine's
+    /// abort token, not this registry) proceeds without holding the registry
+    /// lock; cancellation itself is non-blocking.
+    pub async fn abort_all(&self, reason: &str) {
+        let handles: Vec<RunHandle> = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::sweep_locked(&mut inner);
+            inner
+                .map
+                .values()
+                .filter(|e| !e.handle.is_terminal())
+                .map(|e| e.handle.clone())
+                .collect()
+        };
+        for handle in handles {
+            handle.request_abort(reason);
         }
     }
 }
@@ -354,7 +481,21 @@ async fn run_driver(
                                 }
                             }
                             Err(TurnError::Aborted) => {
-                                // Silent: post-loop cancel drove this; no frame.
+                                // Explicit abort (chat.abort or graceful
+                                // shutdown) → emit a terminal `chat_aborted`
+                                // frame so the BCS SSE consumer sees the final
+                                // `state=aborted` (spec §5.3). A passive BCS
+                                // disconnect (push_raw's broadcast send returns
+                                // no subscribers) does NOT set the abort flag —
+                                // its run closes silently, the stream just ends.
+                                if handle.is_abort_requested() {
+                                    let _ = push_frame(
+                                        &handle,
+                                        &mut seq,
+                                        &run_id,
+                                        &sse::chat_aborted(&run_id, &handle.abort_stop_reason()),
+                                    );
+                                }
                             }
                             Err(e) => {
                                 let _ = push_frame(&handle, &mut seq, &run_id,
@@ -626,5 +767,65 @@ mod tests {
         ]});
         assert_eq!(extract_message_text(Some(&m)), "line1\nignored\nline2");
         assert_eq!(extract_message_text(None), "");
+    }
+
+    #[test]
+    fn request_abort_sets_flag_overrides_reason_and_cancels_token() {
+        // A fresh run handle's flag is false and stop_reason defaults to
+        // "user_cancelled"; calling request_abort flips the flag, overrides the
+        // stop_reason, and cancels the CancellationToken.
+        let reg = RunRegistry::new();
+        let (h, _) = reg.begin("r-a", "fp".into());
+        assert!(!h.is_abort_requested(), "fresh run is not aborted");
+        assert_eq!(h.abort_stop_reason(), "user_cancelled");
+
+        let r2 = h.clone();
+        h.request_abort("provider_shutdown");
+        assert!(h.is_abort_requested(), "flag set after request_abort");
+        assert_eq!(h.abort_stop_reason(), "provider_shutdown", "reason overridden");
+        assert!(r2.is_abort_requested(), "shared flag visible to cloned handle");
+        assert_eq!(r2.abort_stop_reason(), "provider_shutdown");
+        // Cancellation propagates to all clones (CancellationToken is shared).
+        assert!(h.abort.is_cancelled(), "token cancelled after request_abort");
+    }
+
+    #[test]
+    fn find_terminal_run_returns_terminal_match_none_for_active_or_unknown() {
+        // Active run (not terminal): find_terminal_run returns None — abort
+        // goes through the sessions.active_run path instead.
+        let reg = RunRegistry::new();
+        let (_h_active, _) = reg.begin("r-active", "fp".into());
+        reg.record_session("r-active", "bot-1", "s-1");
+        assert_eq!(reg.find_terminal_run("bot-1", "s-1"), None, "active run is not terminal");
+
+        // Mark it terminal: now find_terminal_run resolves to its run_id.
+        reg.finish("r-active");
+        assert_eq!(reg.find_terminal_run("bot-1", "s-1").as_deref(), Some("r-active"));
+
+        // Unknown session and bot mismatch: no match.
+        assert_eq!(reg.find_terminal_run("bot-1", "s-unknown"), None, "unknown session");
+        assert_eq!(reg.find_terminal_run("bot-other", "s-1"), None, "bot mismatch");
+    }
+
+    #[tokio::test]
+    async fn abort_all_cancels_every_active_run_and_skips_terminal() {
+        // Two active + one terminal: only the two active handles have their
+        // abort tokens cancelled after abort_all; the terminal one stays as-is
+        // (it was already cancelled when its run loop finalized).
+        let reg = RunRegistry::new();
+        let (h_a, _) = reg.begin("r-a", "fp".into());
+        let (h_b, _) = reg.begin("r-b", "fp".into());
+        let (h_t, _) = reg.begin("r-t", "fp".into());
+        reg.finish("r-t");
+        assert!(!h_a.abort.is_cancelled());
+        assert!(!h_b.abort.is_cancelled());
+
+        reg.abort_all("provider_shutdown").await;
+
+        assert!(h_a.abort.is_cancelled(), "active run a cancelled");
+        assert!(h_b.abort.is_cancelled(), "active run b cancelled");
+        assert!(!h_t.abort.is_cancelled(), "terminal run skipped");
+        assert!(h_a.is_abort_requested() && h_b.is_abort_requested(), "flag set on each");
+        assert_eq!(h_a.abort_stop_reason(), "provider_shutdown");
     }
 }
