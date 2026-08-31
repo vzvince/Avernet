@@ -19,8 +19,15 @@ pub struct DownstreamRequest {
     pub params: Option<Value>,
 }
 
-pub struct AppState { pub config: ProviderConfig }
-impl AppState { pub fn new(config: ProviderConfig) -> Self { Self { config } } }
+pub struct AppState {
+    pub config: ProviderConfig,
+    pub idem: crate::idempotency::IdempotencyLedger,
+}
+impl AppState {
+    pub fn new(config: ProviderConfig) -> Self {
+        Self { config, idem: crate::idempotency::IdempotencyLedger::new() }
+    }
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new().route("/webhook", post(handle_webhook)).with_state(state)
