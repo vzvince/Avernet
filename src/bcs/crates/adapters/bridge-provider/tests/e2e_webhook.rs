@@ -538,58 +538,130 @@ cwd = "/tmp"
     assert!(status.success(), "graceful shutdown should yield exit 0, got {status}");
 }
 
-/// Task 16 — protocol regression: idempotent re-attach path (spec §5/§6).
+/// Task 16 — protocol regression: idempotent re-attach replays buffered frames
+/// then follows the live broadcast (spec §5/§6).
 ///
-/// `mock_cc_slow.sh` keeps the first chat.send run in-flight (sleep 30s before
-/// emitting any frames), so a same-id, same-body retry hits the active re-attach
-/// path (`RunRegistry::begin` returns `is_new == false` with a matching
-/// fingerprint) — not 429 (`try_start_run` is not re-invoked) and not 409 (body
-/// matches). The re-attached stream replays buffered frames then follows the
-/// broadcast; at re-attach time the slow mock has not pushed any frames yet,
-/// so the first seq frame the second stream observes is the abort's terminal
-/// `chat_aborted` frame (seq=1).
+/// `mock_cc_burst.sh` emits two `text_delta` lines IMMEDIATELY (突发一, 突发二)
+/// then sleeps 30s, so the first chat.send pushes seq 1 and seq 2 into the
+/// run's buffer BEFORE the re-attach. A same-id, same-body retry then takes
+/// the active re-attach path (`RunRegistry::begin` returns `is_new == false`,
+/// fingerprint matches) → 200 (not 429 — `try_start_run` is not re-invoked; not
+/// 409 — body matches). The re-attached stream's forwarder snapshots the buffer
+/// (seq 1, 2) and subscribes to the broadcast.
 ///
-/// Deviation from the brief's literal `second.text().await` + `drop(first)`
-/// shape: the slow mock's 30s sleep would block `second.text()` for 30s. Per
-/// the brief's own note ("测试结束不能真的等 30s"), we send `chat.abort` after
-/// asserting the 200 re-attach to trigger a terminal frame promptly — the
-/// aborted frame carries seq=1, verifying the re-attached stream starts from
-/// the beginning. `kill_on_drop` reclaims the engine subprocess on test exit.
+/// Strengthened per review round 1: the test now genuinely covers the buffer
+/// snapshot → replay → live-follow partition —
+/// 1. read the FIRST stream until both deltas arrive (proves the buffer is
+///    non-empty before the re-attach),
+/// 2. re-attach (second POST) → 200,
+/// 3. read the SECOND stream until both 突发一 + 突发二 replay — these arrive
+///    from the snapshot at seq 1, 2 BEFORE any live frame (asserting them
+///    here, before the abort, proves the replay came from the buffer not a
+///    live re-emission),
+/// 4. chat.abort → the run loop emits a terminal `chat_aborted` frame (seq 3)
+///    pushed AFTER the re-attach's subscribe, so it arrives via the live
+///    broadcast leg,
+/// 5. drain until the aborted terminal at seq 3 — verifying seq continuity
+///    1→2→3 across the buffer→broadcast partition.
+///
+/// `kill_on_drop` reaps the mock subprocess on runtime teardown; the 5s ceilings
+/// protect against the 30s sleep (never reached in practice — the abort
+/// finalizes within milliseconds).
 #[tokio::test]
 async fn duplicate_send_reattaches_with_replay() {
-    let url = support::spawn_app_with_mock("mock_cc_slow.sh", "cfuse-cc").await;
+    let url = support::spawn_app_with_mock("mock_cc_burst.sh", "cfuse-cc").await;
     let client = reqwest::Client::new();
     let body = serde_json::json!({"type":"req","id":"run-dup","method":"chat.send",
         "session_id":"s-1",
         "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
         "message":{"role":"user","content":[{"type":"text","text":"hi"}]}});
 
-    let _first = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+    // 1. First POST — read its chunks until both deltas are buffered. The burst
+    //    mock emits both lines immediately, so this resolves within
+    //    milliseconds; the 5s ceiling guards against a stalled mock.
+    let first = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(first.status(), 200);
+    let mut first_stream = first.bytes_stream();
+    let mut first_acc = String::new();
+    let first_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if first_acc.contains("突发一") && first_acc.contains("突发二") { break; }
+        if std::time::Instant::now() > first_deadline {
+            panic!("first stream did not emit both deltas within 5s: {first_acc}");
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(500), first_stream.next()).await {
+            Ok(Some(chunk)) => first_acc.push_str(&String::from_utf8_lossy(&chunk.unwrap())),
+            Ok(None) => panic!("first stream ended before both deltas: {first_acc}"),
+            Err(_) => continue,
+        }
+    }
+    // Both deltas are now in the run's buffer (push_raw pushes buffer+broadcast
+    // under one mutex), so the re-attach's snapshot will contain them.
 
-    // 同 id 同 body 重发 → 200 重挂（不是 429，不是 409）
+    // 2. Same id + same body retry → 200 re-attach (not 429, not 409). The
+    //    forwarder snapshots the buffer (seq 1, 2) and subscribes to the
+    //    broadcast BEFORE the response is returned, so any later push (the
+    //    aborted frame) reaches this stream via the live broadcast leg.
     let second = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .header("X-BCN-Protocol-Version", "2.0").json(&body).send().await.unwrap();
     assert_eq!(second.status(), 200);
+    let mut second_stream = second.bytes_stream();
+    let mut second_acc = String::new();
 
-    // Abort the run to trigger a terminal frame promptly (the slow mock would
-    // otherwise block 30s). The aborted frame carries seq=1 — the re-attached
-    // stream's first seq frame starts at 1 (replay buffer + broadcast both
-    // partition from the beginning of the run's frame history).
+    // 3. Read the re-attached stream until BOTH buffered deltas replay — these
+    //    arrive from the snapshot at seq 1, 2 BEFORE any live frame. Asserting
+    //    them here (before the abort) proves the replay came from the buffer,
+    //    not a live broadcast re-emission. If the buffer-replay loop in
+    //    `forward_stream` were deleted, this loop would block past the deadline
+    //    (the broadcast is quiet during the 30s sleep) and fail.
+    let replay_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if second_acc.contains("突发一") && second_acc.contains("突发二") { break; }
+        if std::time::Instant::now() > replay_deadline {
+            panic!("re-attached stream did not replay both deltas within 5s: {second_acc}");
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(500), second_stream.next()).await {
+            Ok(Some(chunk)) => second_acc.push_str(&String::from_utf8_lossy(&chunk.unwrap())),
+            Ok(None) => panic!("re-attached stream ended before both deltas replayed: {second_acc}"),
+            Err(_) => continue,
+        }
+    }
+    let replay_seqs = support::extract_seqs(&second_acc);
+    assert_eq!(replay_seqs, vec![1, 2],
+        "buffered replay covers seq 1 and 2 (replay precedes any live frame): {second_acc}");
+
+    // 4. Abort the run to trigger a terminal frame promptly (the slow mock
+    //    would otherwise block 30s). The aborted frame is pushed AFTER the
+    //    re-attach's subscribe, so it arrives via the live broadcast leg —
+    //    verifying buffer-replay → live-follow continuity.
     let _ = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .json(&serde_json::json!({"type":"req","id":"abort-dup","method":"chat.abort",
             "session_id":"s-1",
             "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"}}))
         .send().await;
 
-    let second_text = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        second.text(),
-    ).await.expect("second stream drains within 5s after abort").unwrap();
-    let seqs = support::extract_seqs(&second_text);
-    assert_eq!(seqs.first(), Some(&1), "re-attached stream starts from seq 1: {second_text}");
-    assert!(second_text.contains("\"state\":\"aborted\""), "aborted terminal: {second_text}");
+    // 5. Drain until the aborted terminal arrives at seq 3 (5s ceiling — the
+    //    run loop finalizes within milliseconds of the abort). first_stream is
+    //    held until scope end so the broadcast retains a subscriber while the
+    //    aborted frame is pushed; kill_on_drop reaps the mock subprocess.
+    let abort_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if second_acc.contains("\"state\":\"aborted\"") { break; }
+        if std::time::Instant::now() > abort_deadline {
+            panic!("aborted terminal not received within 5s: {second_acc}");
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(500), second_stream.next()).await {
+            Ok(Some(chunk)) => second_acc.push_str(&String::from_utf8_lossy(&chunk.unwrap())),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(second_acc.contains("\"state\":\"aborted\""), "aborted terminal: {second_acc}");
+    let seqs = support::extract_seqs(&second_acc);
+    assert_eq!(seqs, vec![1, 2, 3],
+        "seq continuity 1→2→3 across buffer→broadcast: {second_acc}");
+    drop(first_stream);
 }
 
 /// Task 16 — protocol regression: same id, different body → 409 conflict
