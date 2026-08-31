@@ -1,6 +1,7 @@
 pub mod cfuse_cc;
 pub mod cfuse_codex;
 pub mod cli;
+pub mod transcript;
 
 use std::path::PathBuf;
 use std::sync::Arc;

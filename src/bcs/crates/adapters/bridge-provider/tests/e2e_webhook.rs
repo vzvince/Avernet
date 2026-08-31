@@ -185,3 +185,31 @@ async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
     assert!(acc.contains("\"phase\":\"resolved\""));
     assert!(acc.contains("\"state\":\"final\""));
 }
+
+#[tokio::test]
+async fn inject_then_send_prepends_for_codex() {
+    // mock_codex.sh emits codex JSONL echoing each prompt line as agent_message
+    // deltas, so the chat.send SSE body carries the assembled prompt text.
+    let url = support::spawn_app_with_mock("mock_codex.sh", "cfuse-codex").await;
+    let client = reqwest::Client::new();
+    let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&json!({"type":"req","id":"inj-1","method":"chat.inject",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"观察上下文"}]},
+            "from":{"kind":"bot","name":"观察者"}}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], json!(true));
+
+    let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({"type":"req","id":"run-9","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"正式问题"}]}}))
+        .send().await.unwrap();
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("观察上下文"), "inject text missing from prompt: {text}");
+    assert!(text.contains("正式问题"), "send message missing from prompt: {text}");
+}

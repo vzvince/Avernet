@@ -181,12 +181,23 @@ pub fn body_fingerprint(req: &DownstreamRequest, session_id: &str) -> String {
 }
 
 /// Prompt assembly for a turn: pending injects (drained FIFO) prepend each as
-/// `[from:{name}] {text}` (or bare `{text}` when `from_name` is `None`), then the
-/// user message text — `message.content[].text` joined with `\n`.
+/// `[from:{name}] {text}` (or bare `{text}` when `from_name` is `None`), then a
+/// blank separator, then the user message text — `message.content[].text`
+/// joined with `\n`. Two injects + body thus render as:
 ///
-/// The pending-inject prepend is the one carry-over from Task 13 wired here per
-/// the brief; multiple content texts are joined with `\n` (UTF-8 safe — no byte
-/// slicing).
+/// ```text
+/// [from:张三] 注入的消息一
+/// 注入的消息二
+///
+/// <本次 message 文本>
+/// ```
+///
+/// The blank line marks where the inject block ends and the current request
+/// begins — visible separation that downstream prompts read as context vs ask.
+/// The pending-inject prepend is the codex fallback (no transcript sink): an
+/// inject that could not be sunk to the engine transcript lives in
+/// `pending_injects` and is drained here on the next chat.send. UTF-8 safe —
+/// no byte slicing.
 async fn assemble_prompt(
     state: &AppState,
     bot: &BotConfig,
@@ -211,13 +222,15 @@ async fn assemble_prompt(
     if prefix.is_empty() {
         body
     } else {
-        format!("{prefix}\n{body}")
+        format!("{prefix}\n\n{body}")
     }
 }
 
 /// Extract `message.content[].text` and join multiple parts with `\n`. Missing
-/// fields yield an empty string (validated upstream).
-fn extract_message_text(message: Option<&serde_json::Value>) -> String {
+/// fields yield an empty string (validated upstream). Reused by the chat.inject
+/// handler to flatten the inject body into the [`crate::session::InjectedMessage`]
+/// text field, so the pending-prepend and transcript-sink paths see one string.
+pub(crate) fn extract_message_text(message: Option<&serde_json::Value>) -> String {
     let Some(msg) = message else { return String::new() };
     let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
         return String::new();
