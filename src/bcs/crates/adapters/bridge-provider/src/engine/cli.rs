@@ -65,6 +65,38 @@ impl CliSession {
         Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
     }
 
+    /// 读取一个 SSE 块（`event:`/`data:` 行聚合到空行），返回 `(event, data)`。
+    ///
+    /// 多行 `data:` 按 SSE 规范用 `\n` 拼接；`event:` 取最后一次出现的值。
+    /// EOF 且无残留（`saw_any == false`）→ `Ok(None)`；EOF 时仍有未分隔块 →
+    /// 返回该部分块（`\n` 终结符丢失不丢已读内容）。空行作为块分隔符。
+    pub async fn next_sse_block(&mut self) -> std::io::Result<Option<(String, String)>> {
+        let mut event = String::new();
+        let mut data_lines: Vec<String> = Vec::new();
+        let mut saw_any = false;
+        loop {
+            match self.next_line().await? {
+                None => return Ok(saw_any.then(|| (event, data_lines.join("\n")))),
+                Some(line) if line.is_empty() => {
+                    return Ok(if saw_any {
+                        Some((event, data_lines.join("\n")))
+                    } else {
+                        None
+                    });
+                }
+                Some(line) => {
+                    saw_any = true;
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        event = v.to_string();
+                    }
+                    if let Some(v) = line.strip_prefix("data: ") {
+                        data_lines.push(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn kill(&mut self) {
         if let Err(e) = self.child.start_kill() {
             tracing::debug!(target: "bridge_provider::engine", "kill failed: {e}");
@@ -95,6 +127,32 @@ mod tests {
         cli.write_line("hello").await.unwrap();
         let line = cli.next_line().await.unwrap().unwrap();
         assert_eq!(line, "ack:hello");
+        cli.kill().await;
+    }
+
+    #[tokio::test]
+    async fn cli_session_next_sse_block_parses_blocks_until_eof() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock_sse.sh");
+        let mut cli = CliSession::spawn(
+            Path::new("bash"),
+            &[script.to_string()],
+            Path::new("."),
+            &[],
+        )
+        .await
+        .unwrap();
+        cli.write_line("go").await.unwrap();
+
+        let (event, data) = cli.next_sse_block().await.unwrap().unwrap();
+        assert_eq!(event, "response.output_text.delta");
+        assert_eq!(data, r#"{"type":"response.output_text.delta","delta":"hi"}"#);
+
+        let (event, data) = cli.next_sse_block().await.unwrap().unwrap();
+        assert_eq!(event, "response.completed");
+        assert_eq!(data, r#"{"type":"response.completed"}"#);
+
+        // EOF after the final blank line → None（无残留块）。
+        assert!(cli.next_sse_block().await.unwrap().is_none());
         cli.kill().await;
     }
 }

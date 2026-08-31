@@ -1,4 +1,5 @@
 pub mod cfuse_cc;
+pub mod cfuse_codex;
 pub mod cli;
 
 use std::path::PathBuf;
@@ -64,38 +65,16 @@ pub trait Engine: Send + Sync {
     ) -> Result<TurnOutcome, TurnError>;
 }
 
-/// Placeholder engine returned by `build_engine` until Tasks 9/10 wire the
-/// real `CfuseCc`/`CfuseCodex` drivers. Its `run_turn` immediately returns
-/// `Err(TurnError::EngineExited("engine not wired"))` — production code must
-/// not panic, so this never uses `unimplemented!`.
-struct StubEngine {
-    kind: EngineKind,
-}
-
-#[async_trait::async_trait]
-impl Engine for StubEngine {
-    fn kind(&self) -> EngineKind {
-        self.kind
-    }
-    async fn run_turn(
-        &self,
-        _req: TurnRequest,
-        _events: tokio::sync::mpsc::Sender<StreamEvent>,
-        _abort: tokio_util::sync::CancellationToken,
-    ) -> Result<TurnOutcome, TurnError> {
-        Err(TurnError::EngineExited("engine not wired".into()))
-    }
-}
-
-/// Build an [`Engine`] for `bot`. `CfuseCc` is wired to the real driver
-/// ([`cfuse_cc::CfuseCc`]); `CfuseCodex` stays on the [`StubEngine`] until
-/// Task 10 lands its driver.
+/// Build an [`Engine`] for `bot`. Both `CfuseCc` and `CfuseCodex` are wired
+/// to their real drivers ([`cfuse_cc::CfuseCc`] / [`cfuse_codex::CfuseCodex`]).
 pub fn build_engine(bot: &BotConfig) -> Arc<dyn Engine> {
     match bot.engine {
         EngineKind::CfuseCc => Arc::new(cfuse_cc::CfuseCc::new(
             bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
         )),
-        EngineKind::CfuseCodex => Arc::new(StubEngine { kind: bot.engine }),
+        EngineKind::CfuseCodex => Arc::new(cfuse_codex::CfuseCodex::new(
+            bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
+        )),
     }
 }
 
@@ -131,30 +110,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_engine_stub_errors_with_configured_kind() {
+    async fn build_engine_wires_cfuse_codex_driver() {
+        // 不 spawn：只确认 build_engine 对 CfuseCodex 返回真实驱动（而非 stub）。
         let bot = BotConfig {
-            provider_bot_ref: "cc-worker".into(),
+            provider_bot_ref: "codex-worker".into(),
             engine: EngineKind::CfuseCodex,
             model: None,
             cwd: "/tmp".into(),
             permission_mode: None,
-            cfuse_bin: None,
+            cfuse_bin: Some(PathBuf::from("/usr/local/bin/cfuse")),
         };
         let engine = build_engine(&bot);
         assert_eq!(engine.kind(), EngineKind::CfuseCodex);
-        let (tx, _rx) = tokio::sync::mpsc::channel::<StreamEvent>(1);
-        let req = TurnRequest {
-            run_id: "r-1".into(), prompt: "hi".into(), engine_session_id: None,
-            cwd: "/tmp".into(), model: None, cfuse_bin: "cfuse".into(), permission_mode: None,
-        };
-        let err = engine
-            .run_turn(req, tx, tokio_util::sync::CancellationToken::new())
-            .await
-            .expect_err("stub must error");
-        match err {
-            TurnError::EngineExited(msg) => assert_eq!(msg, "engine not wired"),
-            other => panic!("expected EngineExited, got {other:?}"),
-        }
     }
 
     #[tokio::test]
