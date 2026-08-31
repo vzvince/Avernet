@@ -22,10 +22,15 @@ pub struct DownstreamRequest {
 pub struct AppState {
     pub config: ProviderConfig,
     pub idem: crate::idempotency::IdempotencyLedger,
+    pub sessions: crate::session::SessionStore,
 }
 impl AppState {
     pub fn new(config: ProviderConfig) -> Self {
-        Self { config, idem: crate::idempotency::IdempotencyLedger::new() }
+        Self {
+            config,
+            idem: crate::idempotency::IdempotencyLedger::new(),
+            sessions: crate::session::SessionStore::new(),
+        }
     }
 }
 

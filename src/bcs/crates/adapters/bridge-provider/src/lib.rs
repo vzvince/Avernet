@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod idempotency;
+pub mod session;
 pub mod sse;
 pub mod webhook;
 
