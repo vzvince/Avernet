@@ -29,7 +29,9 @@ use bcs_protocol::stream::{InteractionKind, InteractionPhase, StreamEvent, ToolD
 use serde_json::{json, Value};
 
 use crate::engine::cli::CliSession;
-use crate::engine::{Engine, EngineKind, TurnError, TurnOutcome, TurnRequest};
+use crate::engine::{
+    is_valid_engine_session_id, Engine, EngineKind, TurnError, TurnOutcome, TurnRequest,
+};
 use crate::sse;
 
 /// `cfuse --cc` (claude stream-json) 引擎驱动。
@@ -254,9 +256,13 @@ fn map_control_request(v: &Value, _run_id: &str) -> CcMap {
 /// Build the kind-specific `extra` payload for the `interaction/requested` SSE
 /// event (per spec §5.2).
 ///
-/// - exec (`tool_name != "AskUserQuestion"`): `{title, command, options}` —
-///   `title` = tool_name, `command` from `input.command` (else null), and the
-///   fixed options `[allow_once, deny]`.
+/// - exec (`tool_name != "AskUserQuestion"`): `{title, options}` plus either
+///   `command` (when `input.command` is a non-empty string) or `description`
+///   (otherwise). BCS validates that a present `command` must be a non-empty
+///   string — a present-but-null/empty command drops the interaction and parks
+///   the run forever, so a missing/non-string command MUST NOT emit the key;
+///   we synthesize a human-readable `description` instead. The fixed options
+///   `[allow_once, deny]` are always present.
 /// - ask_user (`AskUserQuestion`): `{questions}` from `input.questions[]` —
 ///   questionId = `header` fallback `question_N`, options `label → {label,
 ///   value=label}` (cc has no separate value; baas-fallback parity).
@@ -264,15 +270,55 @@ fn build_requested_extra(tool_name: &str, input: &Value) -> Value {
     if tool_name == "AskUserQuestion" {
         json!({ "questions": map_ask_user_questions(input) })
     } else {
-        let command = input.get("command").cloned().unwrap_or(Value::Null);
-        json!({
+        // Only emit `command` when it is a non-empty string; otherwise omit the
+        // key (BCS rejects present-but-null/empty command) and synthesize a
+        // human-readable `description` so the exec interaction still carries
+        // context for the approver.
+        let command = input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let mut extra = json!({
             "title": tool_name,
-            "command": command,
             "options": [
                 { "decision": "allow_once", "label": "Allow once" },
                 { "decision": "deny", "label": "Deny" },
             ],
-        })
+        });
+        match command {
+            Some(cmd) => extra["command"] = json!(cmd),
+            None => extra["description"] = json!(synthesize_exec_description(input)),
+        }
+        extra
+    }
+}
+
+/// Synthesize a human-readable `description` for an exec interaction whose tool
+/// input carries no usable `command` string. Prefer `path`/`file_path` (the
+/// common Read/Edit/Grep shapes); fall back to a compact JSON rendering of the
+/// input, truncated to 200 chars on a UTF-8 character boundary (never byte-slice
+/// — the input may contain multi-byte text). `serde_json::to_string` on a
+/// `Value` cannot fail, but `unwrap_or_default` keeps this panic-free.
+fn synthesize_exec_description(input: &Value) -> String {
+    if let Some(p) = input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return p.to_string();
+    }
+    if let Some(p) = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return p.to_string();
+    }
+    const MAX_LEN: usize = 200;
+    let compact = serde_json::to_string(input).unwrap_or_default();
+    match compact.char_indices().nth(MAX_LEN) {
+        Some((idx, _)) => compact[..idx].to_string(),
+        None => compact,
     }
 }
 
@@ -346,15 +392,21 @@ fn ask_user_has_secret(input: &Value) -> bool {
 /// Map a BCS resolution value to the cc control_response `behavior`
 /// (`"allow"`/`"deny"`).
 ///
-/// v1 limitation (spec §5.2): cc has no answers channel, so an ask_user
-/// resolution collapses to allow/deny only — exec `decision:"deny"` and
-/// ask_user `action:"cancel"` map to `deny`; a non-deny exec decision maps to
-/// `allow`; ask_user `action:"answer"` maps to `allow` only when `answers` is a
-/// non-empty array (cancel and missing/empty answers map to `deny`). The
-/// answers payload itself is dropped (cc v1 cannot consume it).
+/// Conservative mapping (final-review hardening): for exec, an explicit
+/// `decision` allows ONLY when it is one of the known allow-values
+/// (`allow_once`/`allow_session`/`allow_persistent`/`allow_always`); anything
+/// else — including `deny`, an unrecognized/garbage value, or a bare `allow`
+/// not in the allowlist — maps to `deny`. We never infer allow from an unknown
+/// decision. v1 limitation (spec §5.2): cc has no answers channel, so an
+/// ask_user resolution collapses to allow/deny — `action:"answer"` allows only
+/// when `answers` is a non-empty array; `cancel` and missing/empty answers map
+/// to `deny`; the answers payload itself is dropped (cc v1 cannot consume it).
 fn resolution_to_behavior(resolution: &Value) -> &'static str {
     if let Some(d) = resolution["decision"].as_str() {
-        return if d == "deny" { "deny" } else { "allow" };
+        return match d {
+            "allow_once" | "allow_session" | "allow_persistent" | "allow_always" => "allow",
+            _ => "deny",
+        };
     }
     match resolution["action"].as_str() {
         Some("answer") => {
@@ -523,7 +575,23 @@ impl Engine for CfuseCc {
                         return Err(TurnError::EngineExited("stdout EOF before result".into()));
                     };
                     match map_cc_line(&line, &req.run_id) {
-                        CcMap::SessionId(s) => engine_session_id = Some(s),
+                        CcMap::SessionId(s) => {
+                            // Validate before adopting: an engine-supplied id is
+                            // later used as a transcript path component and a
+                            // `--resume` argv argument, so it must be safe. An
+                            // invalid id is logged and treated as no session
+                            // (not persisted, not resumed, transcript sink skipped).
+                            if is_valid_engine_session_id(&s) {
+                                engine_session_id = Some(s);
+                            } else {
+                                tracing::warn!(
+                                    target: "bridge_provider",
+                                    session_id = %s,
+                                    "cc system/init supplied invalid session id; \
+                                     ignoring (not persisted/resumed)"
+                                );
+                            }
+                        }
                         CcMap::Events(evs) => for ev in evs {
                             if events.send(ev).await.is_err() {
                                 cli.kill().await;
@@ -662,10 +730,82 @@ mod tests {
     }
 
     #[test]
-    fn build_requested_extra_exec_defaults_command_to_null_when_missing() {
+    fn build_requested_extra_exec_omits_command_when_missing() {
+        // BCS rejects a present-but-null `command` (interaction dropped → run
+        // parks forever), so when input has no `command` string we MUST NOT emit
+        // the key; we synthesize a `description` from `path`/`file_path` instead.
         let extra = build_requested_extra("Read", &json!({"path":"/a"}));
         assert_eq!(extra["title"], json!("Read"));
-        assert!(extra["command"].is_null(), "non-Bash tools may omit command");
+        assert!(
+            extra.get("command").is_none(),
+            "command key must be absent when input has no command string"
+        );
+        assert_eq!(extra["description"], json!("/a"), "description synthesized from path");
+    }
+
+    #[test]
+    fn build_requested_extra_exec_emits_bcs_valid_shape() {
+        // BCS-side validation rule for what we emit on an exec `requested` extra:
+        // if the `command` key is present it must be a non-empty string, and
+        // `options` must be a non-empty array where each option has a string
+        // `decision` and `label`. Holds for every shape we build.
+        fn assert_bcs_exec_valid(extra: &Value) {
+            if let Some(cmd) = extra.get("command") {
+                assert!(cmd.is_string(), "command must be a string when present: {extra}");
+                let s = cmd.as_str().unwrap();
+                assert!(!s.is_empty(), "command must be non-empty when present: {extra}");
+            }
+            let options = extra
+                .get("options")
+                .and_then(|o| o.as_array())
+                .expect("options must be a non-empty array");
+            assert!(!options.is_empty(), "options must be non-empty: {extra}");
+            for o in options {
+                assert!(
+                    o.get("decision").and_then(|v| v.as_str()).is_some(),
+                    "each option needs a string decision: {extra}"
+                );
+                assert!(
+                    o.get("label").and_then(|v| v.as_str()).is_some(),
+                    "each option needs a string label: {extra}"
+                );
+            }
+        }
+
+        // Non-empty string command → command key present.
+        assert_bcs_exec_valid(&build_requested_extra("Bash", &json!({"command":"ls -la"})));
+        // Missing command → description shape (no command key).
+        assert_bcs_exec_valid(&build_requested_extra("Read", &json!({"path":"/a"})));
+        // Empty-string command → treated as no command (description shape).
+        assert_bcs_exec_valid(&build_requested_extra("Bash", &json!({"command":""})));
+        // Null command → treated as no command (description shape).
+        assert_bcs_exec_valid(&build_requested_extra("Bash", &json!({"command":null})));
+        // No path/file_path either → description falls back to compact JSON.
+        let extra = build_requested_extra("Bash", &json!({"foo":"bar"}));
+        assert!(extra.get("command").is_none(), "no command key when command absent");
+        assert_bcs_exec_valid(&extra);
+        assert!(extra["description"].as_str().unwrap().contains("bar"));
+    }
+
+    #[test]
+    fn synthesize_exec_description_prefers_path_then_falls_back() {
+        // path wins over file_path and JSON fallback.
+        assert_eq!(synthesize_exec_description(&json!({"path":"/a/b","file_path":"/c"})), "/a/b");
+        // file_path used when path absent.
+        assert_eq!(synthesize_exec_description(&json!({"file_path":"/c"})), "/c");
+        // empty path string falls through to file_path, then JSON.
+        assert_eq!(synthesize_exec_description(&json!({"path":"","file_path":"/c"})), "/c");
+        // empty path + no file_path → JSON fallback keeps the empty `path` key.
+        assert_eq!(synthesize_exec_description(&json!({"path":""})), r#"{"path":""}"#);
+        assert_eq!(synthesize_exec_description(&json!({})), "{}");
+        // UTF-8 safe truncation at 200 chars on multibyte text (no mid-char slice).
+        let big = json!({ "k": "你".repeat(300) });
+        let compact = serde_json::to_string(&big).unwrap();
+        let desc = synthesize_exec_description(&big);
+        assert!(desc.chars().count() <= 200, "desc must be at most 200 chars: {}", desc.chars().count());
+        // desc is a char-boundary prefix of the compact JSON — a multi-byte char
+        // is never split (Rust str invariant + `char_indices` truncation).
+        assert!(compact.starts_with(&desc), "desc must be a char-boundary prefix: {desc:?}");
     }
 
     #[test]
@@ -708,9 +848,25 @@ mod tests {
 
     #[test]
     fn resolution_to_behavior_maps_exec_decisions_and_ask_user_actions() {
-        // exec: 显式 deny → deny；其它 decision → allow
-        assert_eq!(resolution_to_behavior(&json!({"decision":"deny"})), "deny");
+        // exec: only explicit allow_* decisions → allow; everything else (deny,
+        // unrecognized/garbage, a bare `allow` not in the allowlist) → deny.
+        // Conservative: never infer allow from an unknown decision.
         assert_eq!(resolution_to_behavior(&json!({"decision":"allow_once"})), "allow");
+        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_session"})), "allow");
+        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_persistent"})), "allow");
+        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_always"})), "allow");
+        assert_eq!(resolution_to_behavior(&json!({"decision":"deny"})), "deny");
+        assert_eq!(
+            resolution_to_behavior(&json!({"decision":"yes"})),
+            "deny",
+            "unknown decision → deny"
+        );
+        assert_eq!(
+            resolution_to_behavior(&json!({"decision":"allow"})),
+            "deny",
+            "bare 'allow' (not in allowlist) → deny"
+        );
+        assert_eq!(resolution_to_behavior(&json!({"decision":"garbage"})), "deny");
         // ask_user: answer + 非空 answers → allow；cancel → deny；缺 answers → deny
         assert_eq!(
             resolution_to_behavior(&json!({"action":"answer","answers":[{"q":"a"}]})),

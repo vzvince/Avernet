@@ -81,6 +81,23 @@ pub fn build_engine(bot: &BotConfig) -> Arc<dyn Engine> {
     }
 }
 
+/// Validate an engine-native session id before it is used as a transcript path
+/// component (`<engine_session_id>.jsonl`) or a `--resume`/`exec resume` argv
+/// argument. An engine must never be a trusted source for these — a buggy or
+/// hostile engine could supply `../../evil` (path traversal) or `--evil`
+/// (argv option injection). Rules: non-empty; no leading dash (argv option
+/// guard); no path separators or parent refs; only ascii alphanumeric plus
+/// `-`/`_`/`.`. The two engine drivers call this at their capture sites (cc
+/// `system/init`, codex `thread.started`); an invalid id is logged and treated
+/// as no session (not persisted, not resumed, transcript sink skipped).
+pub(crate) fn is_valid_engine_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && !id.contains(['/', '\\'])
+        && !id.contains("..")
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +158,31 @@ mod tests {
         };
         let engine = build_engine(&bot);
         assert_eq!(engine.kind(), EngineKind::CfuseCc);
+    }
+
+    #[test]
+    fn is_valid_engine_session_id_accepts_safe_ids() {
+        assert!(is_valid_engine_session_id("cc-sess-1"));
+        assert!(is_valid_engine_session_id("01a058a5-5bb3-7702-bc4c-7d26b3bfa32d"));
+        // underscores and dots are in the allowed set; a single dot is fine.
+        assert!(is_valid_engine_session_id("thread_42"));
+        assert!(is_valid_engine_session_id("sess.1"));
+    }
+
+    #[test]
+    fn is_valid_engine_session_id_rejects_unsafe_ids() {
+        // empty
+        assert!(!is_valid_engine_session_id(""), "empty rejected");
+        // path separators (path traversal)
+        assert!(!is_valid_engine_session_id("a/b"), "forward slash rejected");
+        assert!(!is_valid_engine_session_id("a\\b"), "backslash rejected");
+        assert!(!is_valid_engine_session_id("../x"), "parent ref rejected");
+        assert!(!is_valid_engine_session_id("a..b"), "embedded parent ref rejected");
+        // leading dash (argv option injection)
+        assert!(!is_valid_engine_session_id("--evil"), "leading dash rejected");
+        // whitespace / other disallowed chars
+        assert!(!is_valid_engine_session_id("a b"), "space rejected");
+        assert!(!is_valid_engine_session_id("a:b"), "colon rejected");
+        assert!(!is_valid_engine_session_id("café"), "non-ascii rejected");
     }
 }

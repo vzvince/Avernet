@@ -692,11 +692,18 @@ pub fn spawn_run(
     session_id: String,
     handle: RunHandle,
 ) -> Response {
-    let driver_handle = handle.clone();
+    // Build the forward stream BEFORE spawning the driver. `forward_stream`
+    // subscribes to the broadcast synchronously inside the call; the driver's
+    // heartbeat interval first-ticks immediately, and a broadcast send with no
+    // live receiver reads as a BCS disconnect (`push_raw` returns false → the
+    // run breaks as a false-positive disconnect). Subscribing first guarantees a
+    // receiver exists before the driver can send its first heartbeat.
+    let stream = forward_stream(handle.clone());
+    let driver_handle = handle;
     tokio::spawn(async move {
         run_driver(state, driver_handle, req, bot, session_id).await;
     });
-    sse_response(forward_stream(handle))
+    sse_response(stream)
 }
 
 /// Re-attach a terminal run's buffered frames as a fresh one-shot SSE stream

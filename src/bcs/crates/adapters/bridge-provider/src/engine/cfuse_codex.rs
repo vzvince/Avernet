@@ -35,7 +35,9 @@ use bcs_protocol::stream::StreamEvent;
 use serde_json::Value;
 
 use crate::engine::cli::CliSession;
-use crate::engine::{Engine, EngineKind, TurnError, TurnOutcome, TurnRequest};
+use crate::engine::{
+    is_valid_engine_session_id, Engine, EngineKind, TurnError, TurnOutcome, TurnRequest,
+};
 use crate::sse;
 
 /// `cfuse --codex` (codex `exec --json` JSONL) 引擎驱动。
@@ -206,7 +208,24 @@ impl Engine for CfuseCodex {
                         return Err(TurnError::EngineExited("stdout EOF before result".into()));
                     };
                     match map_codex_line(&line, &req.run_id) {
-                        CodexMap::SessionId(sid) => engine_session_id = Some(sid),
+                        CodexMap::SessionId(sid) => {
+                            // Validate before adopting: an engine-supplied id is
+                            // later used as a transcript path component and an
+                            // `exec resume <sid>` argv argument, so it must be
+                            // safe. An invalid id is logged and treated as no
+                            // session (not persisted, not resumed, transcript
+                            // sink skipped).
+                            if is_valid_engine_session_id(&sid) {
+                                engine_session_id = Some(sid);
+                            } else {
+                                tracing::warn!(
+                                    target: "bridge_provider",
+                                    session_id = %sid,
+                                    "codex thread.started supplied invalid session id; \
+                                     ignoring (not persisted/resumed)"
+                                );
+                            }
+                        }
                         CodexMap::Events(evs) => {
                             for ev in evs {
                                 if let StreamEvent::Chat(c) = &ev {
