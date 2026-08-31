@@ -9,15 +9,16 @@ use bcs_protocol::stream::StreamEvent;
 
 pub use crate::config::EngineKind;
 use crate::config::BotConfig;
+use crate::interaction::InteractionRegistry;
 
 /// One BCS downstream turn request.
 ///
 /// `run_id` is the BCS downstream body id; frames use it as `runId`.
 /// `engine_session_id` carries the engine-native session id on follow-up turns.
 /// `cfuse_bin` is the resolved engine binary path.
-///
-/// Note: an `interactions` field is added later by Task 12 together with the
-/// `InteractionRegistry` it needs; this task defines only the fields below.
+/// `interactions` is the run's HITL interaction registry: the cc driver
+/// registers pending `can_use_tool`/`AskUserQuestion` requests with it, the
+/// webhook `interaction.resolve` handler delivers decisions to it.
 pub struct TurnRequest {
     pub run_id: String,
     pub prompt: String,
@@ -26,6 +27,7 @@ pub struct TurnRequest {
     pub model: Option<String>,
     pub cfuse_bin: PathBuf,
     pub permission_mode: Option<String>,
+    pub interactions: InteractionRegistry,
 }
 
 /// Outcome of an engine turn: the engine-internal session id (if one was
@@ -103,6 +105,7 @@ mod tests {
         let req = TurnRequest {
             run_id: "r-1".into(), prompt: "hi".into(), engine_session_id: None,
             cwd: ".".into(), model: None, cfuse_bin: "cfuse".into(), permission_mode: None,
+            interactions: InteractionRegistry::new(),
         };
         let outcome = engine.run_turn(req, tx, tokio_util::sync::CancellationToken::new()).await.unwrap();
         assert_eq!(outcome.engine_session_id.as_deref(), Some("e-1"));

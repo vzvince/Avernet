@@ -32,6 +32,7 @@ use axum::response::Response;
 use bcs_protocol::now_ms;
 use bcs_protocol::stream::{ChatState, StreamEvent};
 use futures::stream::{StreamExt, Stream};
+use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -260,6 +261,7 @@ async fn run_driver(
         model: bot.model.clone(),
         cfuse_bin: bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
         permission_mode: bot.permission_mode.clone(),
+        interactions: state.interactions.clone(),
     };
 
     let (ev_tx, mut ev_rx) = mpsc::channel::<StreamEvent>(64);
@@ -354,8 +356,18 @@ async fn run_driver(
         }
     }
 
-    // Finalize: cancel the engine (idempotent), await its task if we did not
-    // already, then mark terminal, release the session slot, notify registry.
+    // Finalize: release any parked HITL interactions with a deny fallback
+    // (spec §6.3: deadline → safe fallback; abort → deny) so the driver's
+    // resolution_rx never blocks on a dead receiver. Done BEFORE cancelling
+    // the engine so the fallback is delivered through the resolution channel
+    // rather than lost to a dropped receiver; entries are retained (marked
+    // resolved) so a late BCS resolve replays as Duplicate instead of Unknown.
+    state
+        .interactions
+        .invalidate_run(&run_id, json!({ "decision": "deny" }));
+
+    // Cancel the engine (idempotent), await its task if we did not already,
+    // then mark terminal, release the session slot, notify registry.
     handle.abort.cancel();
     if let Some(h) = engine_handle.take() {
         let _ = h.await;

@@ -3,7 +3,7 @@ use axum::{extract::State, http::HeaderMap, response::{IntoResponse, Response}, 
 use bcs_protocol::BCN_PROTOCOL_VERSION_HEADER;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::{config::ProviderConfig, error::BridgeError, run::RunRegistry};
+use crate::{config::ProviderConfig, error::BridgeError, interaction::ResolveOutcome, run::RunRegistry};
 
 #[derive(Debug, Deserialize)]
 pub struct ToBot { pub provider_id: String, pub provider_bot_ref: String }
@@ -25,7 +25,7 @@ pub struct AppState {
     pub idem: crate::idempotency::IdempotencyLedger,
     pub sessions: crate::session::SessionStore,
     pub runs: RunRegistry,
-    // InteractionRegistry lands with Task 12.
+    pub interactions: crate::interaction::InteractionRegistry,
 }
 impl AppState {
     pub fn new(config: ProviderConfig) -> Self {
@@ -34,6 +34,7 @@ impl AppState {
             idem: crate::idempotency::IdempotencyLedger::new(),
             sessions: crate::session::SessionStore::new(),
             runs: RunRegistry::new(),
+            interactions: crate::interaction::InteractionRegistry::new(),
         }
     }
 }
@@ -71,8 +72,13 @@ async fn dispatch(
     match req.method.as_str() {
         "bot.ping" => Ok(Json(json!({"ok": true})).into_response()),
         "chat.send" => handle_chat_send(state, headers, req).await,
-        "chat.inject" | "chat.abort" | "interaction.resolve" => {
-            // Tasks 12/13 implement these; chat.send is wired here.
+        // `interaction.resolve` carries the BCS HITL decision back to a parked
+        // cc control request. Its ACK error shape is a STRING error (spec
+        // §5.1), distinct from `BridgeError`'s object shape — handled in its
+        // own branch so it never reaches the shared error renderer.
+        "interaction.resolve" => Ok(handle_interaction_resolve(state, req).await),
+        "chat.inject" | "chat.abort" => {
+            // Task 13 implements inject/abort; unavailable here.
             Err(BridgeError::unavailable("not yet implemented"))
         }
         other => Err(BridgeError::unsupported_method(other)),
@@ -141,4 +147,53 @@ async fn handle_chat_send(
     // spawn a duplicate driver). The slot we reserved is for the same run_id,
     // so releasing it would wrongly clear the winner's reservation — leave it.
     Ok(crate::run::sse_response(crate::run::forward_stream(handle)))
+}
+
+/// `interaction.resolve` ACK with a STRING error (spec §5.1 — this method does
+/// not share `BridgeError`'s `{code,message,retryable}` object shape). 200 OK
+/// carries the protocol-level ok/false so the BCS retry layer reads `error`.
+fn resolve_err_ack(message: &str) -> Response {
+    Json(json!({ "ok": false, "retryable": false, "error": message })).into_response()
+}
+
+/// Handle `interaction.resolve`: deliver the BCS decision (exec `decision` or
+/// ask_user `action`+`answers`) to the parked driver via the registry.
+///
+/// ACK semantics (spec §5.1):
+/// - `Delivered` (first resolve) and `Duplicate` (idempotent replay of an
+///   already-delivered interaction) → `{"ok":true}` — `Duplicate` does not
+///   re-write the engine control channel.
+/// - `Unknown` (no such `interactionId`) → `{"ok":false,"retryable":false,
+///   "error":"unknown interaction"}`.
+/// - Malformed params (missing interactionId/idempotencyKey or
+///   decision|action) → `{"ok":false,"retryable":false,"error":"<reason>"}`.
+async fn handle_interaction_resolve(state: Arc<AppState>, req: DownstreamRequest) -> Response {
+    let params = req.params.clone().unwrap_or(Value::Null);
+
+    let Some(interaction_id) = params.get("interactionId").and_then(|v| v.as_str()) else {
+        return resolve_err_ack("missing interactionId");
+    };
+    let Some(idempotency_key) = params.get("idempotencyKey").and_then(|v| v.as_str()) else {
+        return resolve_err_ack("missing idempotencyKey");
+    };
+
+    // Build the resolution payload consumed by the driver's behavior mapping.
+    // exec: {"decision": <decision>}. ask_user: {"action": <action>, "answers":
+    // [...]}. The driver collapses ask_user to allow/deny (cc v1 has no answers
+    // channel); `action:"cancel"` and missing answers map to deny.
+    let resolution = if let Some(decision) = params.get("decision").cloned() {
+        json!({ "decision": decision })
+    } else if let Some(action) = params.get("action").cloned() {
+        let answers = params.get("answers").cloned().unwrap_or_else(|| json!([]));
+        json!({ "action": action, "answers": answers })
+    } else {
+        return resolve_err_ack("decision or action required");
+    };
+
+    match state.interactions.resolve(interaction_id, idempotency_key, resolution) {
+        ResolveOutcome::Delivered | ResolveOutcome::Duplicate => {
+            Json(json!({ "ok": true })).into_response()
+        }
+        ResolveOutcome::Unknown => resolve_err_ack("unknown interaction"),
+    }
 }

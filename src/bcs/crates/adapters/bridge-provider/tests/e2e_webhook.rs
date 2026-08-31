@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use futures::StreamExt;
 use serde_json::json;
 
 mod support; // tests/support/mod.rs：spawn_app(config_toml: &str) -> String(base_url)
@@ -121,4 +122,66 @@ async fn concurrent_send_same_session_gets_429() {
     let err: serde_json::Value = second.json().await.unwrap();
     assert_eq!(err["error"]["code"], serde_json::json!("rate_limited"));
     assert_eq!(err["error"]["retryable"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
+    // mock_cc_approval.sh：读 user 消息后吐 control_request(can_use_tool Bash)，
+    // 等待 stdin 的 control_response，按 behavior 吐 result。
+    let url = support::spawn_app_with_mock("mock_cc_approval.sh", "cfuse-cc").await;
+    let client = reqwest::Client::new();
+    let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({"type":"req","id":"run-1","method":"chat.send",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"执行一下"}]}}))
+        .send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut stream = resp.bytes_stream();
+    let mut acc = String::new();
+    // 读到 interaction/requested 帧为止
+    let iid = loop {
+        let chunk = stream.next().await.unwrap().unwrap();
+        acc.push_str(&String::from_utf8_lossy(&chunk));
+        if acc.contains("\"phase\":\"requested\"") {
+            break support::extract_first_interaction_id(&acc);
+        }
+    };
+    // BCS 回程：interaction.resolve
+    let ack = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&json!({"type":"req","id":"resolve-1","method":"interaction.resolve",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "params":{"bcsRunId":"run-1","runId":"run-1","interactionId":iid,
+                      "kind":"exec","idempotencyKey":"key-1","decision":"allow_once"}}))
+        .send().await.unwrap();
+    assert_eq!(ack.json::<serde_json::Value>().await.unwrap()["ok"], json!(true));
+    // 幂等重放同 key
+    let dup = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&json!({"type":"req","id":"resolve-2","method":"interaction.resolve",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "params":{"bcsRunId":"run-1","runId":"run-1","interactionId":iid,
+                      "kind":"exec","idempotencyKey":"key-1","decision":"allow_once"}}))
+        .send().await.unwrap();
+    assert_eq!(dup.json::<serde_json::Value>().await.unwrap()["ok"], json!(true));
+    // 未知 interactionId → 字符串形态 error
+    let unknown = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .json(&json!({"type":"req","id":"resolve-3","method":"interaction.resolve",
+            "session_id":"s-1",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "params":{"bcsRunId":"run-1","runId":"run-1","interactionId":"int-nope",
+                      "kind":"exec","idempotencyKey":"key-9","decision":"deny"}}))
+        .send().await.unwrap();
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["ok"], json!(false));
+    assert!(body["error"].is_string());  // 注意：此方法的 error 是字符串（spec §5.1）
+    // 流继续：resolved → chat/final
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("\"state\":\"final\"") { break; }
+    }
+    assert!(acc.contains("\"phase\":\"resolved\""));
+    assert!(acc.contains("\"state\":\"final\""));
 }

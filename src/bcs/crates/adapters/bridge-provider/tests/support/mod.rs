@@ -48,3 +48,15 @@ pub fn extract_seqs(sse_text: &str) -> Vec<u64> {
         .filter_map(|v| v["seq"].as_u64())
         .collect()
 }
+
+/// 从 SSE 文本抽取首个 interaction 帧的 `interactionId`。用于端到端
+/// interaction 回环测试：BCS 侧拿到 iid 再调 `interaction.resolve`。
+pub fn extract_first_interaction_id(sse_text: &str) -> String {
+    sse_text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .find(|v| v["interactionId"].is_string())
+        .and_then(|v| v["interactionId"].as_str().map(str::to_string))
+        .expect("interaction requested frame present")
+}
