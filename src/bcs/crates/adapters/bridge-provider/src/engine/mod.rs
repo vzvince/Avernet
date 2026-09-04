@@ -1,5 +1,6 @@
 pub mod cfuse_cc;
 pub mod cfuse_codex;
+pub mod cfuse_codex_app_server;
 pub mod cli;
 pub mod transcript;
 
@@ -68,14 +69,16 @@ pub trait Engine: Send + Sync {
     ) -> Result<TurnOutcome, TurnError>;
 }
 
-/// Build an [`Engine`] for `bot`. Both `CfuseCc` and `CfuseCodex` are wired
-/// to their real drivers ([`cfuse_cc::CfuseCc`] / [`cfuse_codex::CfuseCodex`]).
+/// Build an [`Engine`] for `bot`. `CfuseCc` uses the Claude stream-json driver;
+/// `CfuseCodex` uses the Codex app-server JSON-RPC driver. The legacy
+/// [`cfuse_codex::CfuseCodex`] mapping module remains available for protocol
+/// fixtures while new runtime turns use app-server for streaming/resume.
 pub fn build_engine(bot: &BotConfig) -> Arc<dyn Engine> {
     match bot.engine {
         EngineKind::CfuseCc => Arc::new(cfuse_cc::CfuseCc::new(
             bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
         )),
-        EngineKind::CfuseCodex => Arc::new(cfuse_codex::CfuseCodex::new(
+        EngineKind::CfuseCodex => Arc::new(cfuse_codex_app_server::CfuseCodexAppServer::new(
             bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
         )),
     }

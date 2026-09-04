@@ -115,9 +115,11 @@ Engine stdout ──→ EventMapper ──→ SseEncoder(seq/buffer) ──→ S
    stream-json --verbose --include-partial-messages`），assistant/text 增量 →
    `chat/delta`，tool_use/tool_result → `agent/tool`，`can_use_tool` 控制消息 →
    `interaction/requested(exec)`，AskUserQuestion → `interaction/requested(ask_user)`；
-   cfuse codex：Codex SSE（`response.output_text.delta` → `chat/delta`，
-   `response.completed/failed` → terminal，权限请求 → `interaction`）。
-   精确字段映射以实现期对真实 cfuse 输出的契约测试为准。
+   cfuse codex：Codex app-server JSON-RPC over stdio（
+   `item/agentMessage/delta` → `chat/delta`，
+   `turn/completed/agent/turn_failed` → terminal；其它 app-server
+   notifications 按 thread/turn 关联过滤）。精确字段映射以实现期对真实
+   cfuse 输出的契约测试为准。
 4. **SseEncoder**：`StreamEvent` → `event:/id:/data:` 文本帧；赋 `seq`
    （per-run 单调，自 1 起，跨 chat/agent/interaction 共享），SSE `id:` 镜像
    `seq`；帧 ≤ 8 MiB；UTF-8 安全切分（`char_indices`，禁止字节切片——
@@ -248,7 +250,7 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
    取出 pending injects（transcript sink 不可用引擎的前置注入）。
 2. 立即 `200 + Content-Type: text/event-stream` 应答（远早于 125s 响应头
    deadline），run task 持有该响应流。
-3. spawn 引擎（cfuse cc/codex，stream-json I/O，交互权限模式）。
+3. spawn 引擎（cfuse cc stream-json 或 codex app-server JSON-RPC I/O，交互权限模式）。
 4. 从引擎流捕获 engine session id → **立即持久化映射**（run 中途失败也保留下次
    resume 能力）。
 5. 引擎事件 → EventMapper → SseEncoder（赋 seq）→ 写 SSE + 入 run buffer。
@@ -284,7 +286,7 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
 | BCS 断连（写失败） | SSE write error | **立即杀 run**（协议无重连续传；BCS 已合成 terminal error） |
 | 重复 chat.send（同 id 同 body） | 幂等台账 | 见 §5.5（重挂/重放） |
 | 同 session 并发第二个 chat.send | SessionMapping.active_run 占用 | `429 rate_limited`（retryable） |
-| bridge 进程重启 | — | 子进程同灭、run 全失；BCS 新 run 凭引擎 transcript `--resume` 恢复上下文 |
+| bridge 进程重启 | — | 子进程同灭、run 全失；BCS 新 run 凭 Codex app-server `thread/resume` 或 cc transcript `--resume` 恢复上下文 |
 | interaction.resolve 指向未知 id | 查 registry | `{"ok":false,"retryable":false,"error":"unknown interaction"}` |
 | 单帧 > 8 MiB 风险 | encoder 侧检查 | 截断/降级为 error 帧（脱敏），不产生超限帧 |
 

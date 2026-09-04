@@ -8,7 +8,8 @@
 //! // 首轮（无 engine_session_id）：
 //! cfuse --codex exec --json --skip-git-repo-check -C <cwd> [-m <model>] <prompt>
 //! // 续轮（resume 已捕获的 codex thread）：
-//! cfuse --codex exec resume <engine_session_id> --json [-m <model>] <prompt>
+//! cfuse --codex exec resume <engine_session_id> --json --skip-git-repo-check
+//!       [-m <model>] <prompt>
 //! ```
 //!
 //! `thread.started` 携带 `thread_id`——引擎内会话 id，续轮经 `exec resume <sid>`
@@ -169,16 +170,18 @@ impl Engine for CfuseCodex {
     ) -> Result<TurnOutcome, TurnError> {
         // `cfuse --codex` 透传到 `codex exec`。首轮用 `exec` + cwd/git flags；
         // 续轮用 `exec resume <sid>` 恢复 codex thread（thread_id 由上轮
-        // `thread.started` 捕获）。`--json` 两者都加；`-m` 经核实属 `codex exec`
-        // 通用 flag。`--permission-mode` codex exec 不接受，故不拼。
+        // `thread.started` 捕获）。`--json` 与 `--skip-git-repo-check` 两者都
+        // 加；`CliSession::spawn` 已用 `current_dir(req.cwd)` 保证续轮也在相同
+        // 工作目录中运行。`-m` 经核实属 `codex exec` 通用 flag；
+        // `--permission-mode` codex exec 不接受，故不拼。
         let mut args: Vec<String> = vec!["--codex".into(), "exec".into()];
         if let Some(sid) = &req.engine_session_id {
             args.push("resume".into());
             args.push(sid.clone());
         }
         args.push("--json".into());
+        args.push("--skip-git-repo-check".into());
         if req.engine_session_id.is_none() {
-            args.push("--skip-git-repo-check".into());
             args.push("-C".into());
             args.push(req.cwd.to_string_lossy().into_owned());
         }

@@ -223,9 +223,9 @@ async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
 
 #[tokio::test]
 async fn inject_then_send_prepends_for_codex() {
-    // mock_codex.sh emits codex JSONL echoing each prompt line as agent_message
-    // deltas, so the chat.send SSE body carries the assembled prompt text.
-    let url = support::spawn_app_with_mock("mock_codex.sh", "cfuse-codex").await;
+    // mock_codex_app_server.py emits app-server delta notifications, so the
+    // chat.send SSE body carries the assembled prompt text.
+    let url = support::spawn_app_with_mock("mock_codex_app_server.py", "cfuse-codex").await;
     let client = reqwest::Client::new();
     let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .json(&json!({"type":"req","id":"inj-1","method":"chat.inject",
@@ -247,8 +247,8 @@ async fn inject_then_send_prepends_for_codex() {
     let text = resp.text().await.unwrap();
     // The prefix from the injected message is prepended with the `[from:{name}]`
     // envelope, and it must precede the current `正式问题` message body in the
-    // assembled prompt. mock_codex.sh echoes each non-blank prompt line as its
-    // own `agent_message` text inside a JSONL frame that the codex driver maps
+    // assembled prompt. mock_codex_app_server.py echoes it as an
+    // `item/agentMessage/delta` notification that the app-server driver maps
     // to a chat_delta SSE event — so both needles appear literally in the SSE
     // stream text (no JSON-escaping of these ASCII-bracket/multi-byte chars).
     assert!(text.contains("[from:观察者] 观察上下文"), "inject prefix missing: {text}");
@@ -256,6 +256,42 @@ async fn inject_then_send_prepends_for_codex() {
         .expect("inject prefix position");
     let pos_main = text.find("正式问题").expect("main message position");
     assert!(pos_inject < pos_main, "inject must precede the current message: {text}");
+}
+
+#[tokio::test]
+async fn codex_app_server_resume_streams_two_turns() {
+    // The app-server peer handles both thread/start and thread/resume and
+    // emits a real item/agentMessage/delta notification for each turn.
+    let url = support::spawn_app_with_mock("mock_codex_app_server.py", "cfuse-codex").await;
+    let client = reqwest::Client::new();
+
+    let send = |id: &str, text: &str| {
+        client
+            .post(format!("{url}/webhook"))
+            .bearer_auth("tok-b2p")
+            .header("X-BCN-Protocol-Version", "2.0")
+            .json(&json!({
+                "type": "req", "id": id, "method": "chat.send",
+                "session_id": "s-1",
+                "to_bot": {"provider_id": "bridge-1", "provider_bot_ref": "worker-1"},
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+            }))
+    };
+
+    let first = send("codex-run-1", "首轮").send().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_text = first.text().await.unwrap();
+    assert!(first_text.contains("首轮"), "first app-server turn failed: {first_text}");
+    assert!(first_text.contains("\"state\":\"final\""), "missing first final: {first_text}");
+
+    let second = send("codex-run-2", "续轮").send().await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_text = second.text().await.unwrap();
+    assert!(second_text.contains("续轮"), "app-server resume turn failed: {second_text}");
+    let delta = second_text.find("\"state\":\"delta\"").expect("resume delta");
+    let final_ = second_text.find("\"state\":\"final\"").expect("resume final");
+    assert!(delta < final_, "streamed delta must precede final: {second_text}");
+    assert!(second_text.contains("\"state\":\"final\""), "missing resume final: {second_text}");
 }
 
 #[tokio::test]
