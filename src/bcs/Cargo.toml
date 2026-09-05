@@ -7,6 +7,7 @@ members = [
     "crates/adapters/http/bcs-http",
     "crates/adapters/http/bcs-provider-http",
     "crates/adapters/ws/bcs-ws",
+    "crates/adapters/bridge-provider",
     # service-api
     "crates/service-api/bcs-config-api",
     "crates/service-api/bcs-service-api",
@@ -127,6 +128,7 @@ version      = "0.1.0"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 
 # HTTP server

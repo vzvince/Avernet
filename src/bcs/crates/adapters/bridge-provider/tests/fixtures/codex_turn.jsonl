@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"codex-thread-1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"正在"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"排查"}}
+{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"正在分析根因"}}
+{"type":"turn.completed","usage":{"input_tokens":5523,"output_tokens":24}}
