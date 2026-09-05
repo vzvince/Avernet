@@ -120,12 +120,20 @@ fn map_stream_event(v: &Value, run_id: &str) -> CcMap {
         None => return CcMap::Ignore,
     };
     let dtype = delta.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    if dtype != "text_delta" {
-        return CcMap::Ignore;
-    }
-    match delta.get("text").and_then(|x| x.as_str()) {
-        Some(text) => CcMap::Events(vec![sse::chat_delta(run_id, text)]),
-        None => CcMap::Ignore,
+    match dtype {
+        "text_delta" => match delta.get("text").and_then(|x| x.as_str()) {
+            Some(text) => CcMap::Events(vec![sse::chat_delta(run_id, text)]),
+            None => CcMap::Ignore,
+        },
+        "thinking_delta" => match delta.get("thinking").and_then(|x| x.as_str()) {
+            Some(text) if !text.is_empty() => CcMap::Events(vec![sse::agent_thinking(
+                run_id,
+                Some(text.to_string()),
+                None,
+            )]),
+            _ => CcMap::Ignore,
+        },
+        _ => CcMap::Ignore,
     }
 }
 
@@ -547,7 +555,7 @@ impl Engine for CfuseCc {
             args.push(model.clone());
         }
 
-        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[])
+        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[], req.trace.clone())
             .await
             .map_err(TurnError::Spawn)?;
 
@@ -945,5 +953,22 @@ mod tests {
     fn stream_event_non_text_delta_is_ignore() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
         assert!(matches!(map_cc_line(line, "r-1"), CcMap::Ignore));
+    }
+
+    #[test]
+    fn stream_event_thinking_delta_emits_thinking_event() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"分析中"}}}"#;
+        match map_cc_line(line, "r-1") {
+            CcMap::Events(events) => match &events[0] {
+                StreamEvent::Agent(agent) => match &agent.data {
+                    bcs_protocol::stream::AgentData::Thinking(thinking) => {
+                        assert_eq!(thinking.delta.as_deref(), Some("分析中"));
+                    }
+                    other => panic!("expected Thinking, got {other:?}"),
+                },
+                other => panic!("expected Agent, got {other:?}"),
+            },
+            other => panic!("expected Events, got {other:?}"),
+        }
     }
 }

@@ -21,6 +21,8 @@ pub struct ProviderConfig {
     pub listen: SocketAddr,
     pub bcs_to_provider_token: String,
     pub bot_runtime_token: Option<String>,
+    #[serde(default)]
+    pub trace_dir: Option<PathBuf>,
     #[serde(rename = "bot")]
     pub bots: Vec<BotConfig>,
 }

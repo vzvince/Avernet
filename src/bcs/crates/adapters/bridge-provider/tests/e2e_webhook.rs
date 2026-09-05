@@ -295,6 +295,86 @@ async fn codex_app_server_resume_streams_two_turns() {
 }
 
 #[tokio::test]
+async fn codex_app_server_emits_thinking_and_tool_events() {
+    let url = support::spawn_app_with_mock("mock_codex_app_server.py", "cfuse-codex").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/webhook"))
+        .bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({
+            "type": "req", "id": "events-run", "method": "chat.send",
+            "session_id": "events-session",
+            "to_bot": {"provider_id": "bridge-1", "provider_bot_ref": "worker-1"},
+            "message": {"role": "user", "content": [{"type": "text", "text": "事件测试"}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: agent"), "missing agent events: {text}");
+    assert!(text.contains("\"stream\":\"tool\""), "missing tool stream: {text}");
+    assert!(text.contains("\"phase\":\"start\""), "missing tool start: {text}");
+    assert!(text.contains("\"phase\":\"update\""), "missing tool update: {text}");
+    assert!(text.contains("\"phase\":\"result\""), "missing tool result: {text}");
+    assert!(text.contains("\"stream\":\"thinking\""), "missing thinking stream: {text}");
+    assert!(text.contains("事件测试"), "missing chat output: {text}");
+    assert!(text.contains("\"state\":\"final\""), "missing final: {text}");
+}
+
+#[tokio::test]
+async fn trace_records_raw_converted_and_sse_events() {
+    let trace_dir = tempfile::tempdir().unwrap();
+    let bin = format!(
+        "{}/tests/fixtures/mock_codex_app_server.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let (url, _state) = support::spawn_app_with_state(&format!(
+        r#"
+provider_id = "bridge-1"
+listen = "127.0.0.1:0"
+bcs_to_provider_token = "tok-b2p"
+trace_dir = "{}"
+[[bot]]
+provider_bot_ref = "worker-1"
+engine = "cfuse-codex"
+cwd = "/tmp"
+cfuse_bin = "{}"
+"#,
+        trace_dir.path().display(),
+        bin
+    ))
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{url}/webhook"))
+        .bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({
+            "type": "req", "id": "trace-run", "method": "chat.send",
+            "session_id": "trace-session",
+            "to_bot": {"provider_id": "bridge-1", "provider_bot_ref": "worker-1"},
+            "message": {"role": "user", "content": [{"type": "text", "text": "trace"}]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.unwrap();
+
+    let raw = std::fs::read_to_string(trace_dir.path().join("engine.raw.ndjson")).unwrap();
+    let converted = std::fs::read_to_string(trace_dir.path().join("bridge.converted.ndjson")).unwrap();
+    let sse = std::fs::read_to_string(trace_dir.path().join("bridge.sse.ndjson")).unwrap();
+    assert!(raw.contains("\"engine_to_bridge\""));
+    assert!(raw.contains("item/agentMessage/delta"));
+    assert!(converted.contains("\"bridge_converted\""));
+    assert!(converted.contains("\"stream\":\"tool\""));
+    assert!(converted.contains("\"stream\":\"thinking\""));
+    assert!(sse.contains("\"bridge_to_bcs\""));
+    assert!(sse.contains("event: chat"));
+    assert!(sse.contains("event: agent"));
+}
+
+#[tokio::test]
 async fn inject_sinks_to_cc_transcript_and_does_not_pending() {
     // cc sink-success branch: with an established `engine_session_id`, a cc
     // bot's inject must land in the engine transcript file (and NOT also be

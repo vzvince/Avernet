@@ -37,6 +37,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{build_engine, TurnError, TurnOutcome, TurnRequest};
+use crate::engine::trace::TraceContext;
 use crate::sse::{self, event_to_frame, FrameError, HEARTBEAT};
 use crate::webhook::{AppState, DownstreamRequest};
 use crate::config::BotConfig;
@@ -417,9 +418,20 @@ async fn run_driver(
         cfuse_bin: bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
         permission_mode: bot.permission_mode.clone(),
         interactions: state.interactions.clone(),
+        trace: state.trace.as_ref().map(|store| {
+            TraceContext::new(
+                store.clone(),
+                match bot.engine {
+                    crate::config::EngineKind::CfuseCc => "cfuse-cc",
+                    crate::config::EngineKind::CfuseCodex => "cfuse-codex",
+                },
+                run_id.clone(),
+            )
+        }),
     };
 
     let (ev_tx, mut ev_rx) = mpsc::channel::<StreamEvent>(64);
+    let trace = turn_req.trace.clone();
     let abort_token = handle.abort.clone();
     let engine = build_engine(&bot);
     let mut engine_handle: Option<tokio::task::JoinHandle<Result<TurnOutcome, TurnError>>> =
@@ -441,7 +453,8 @@ async fn run_driver(
             _ = &mut deadline => {
                 // Deadline: emit terminal chat_error(deadline) and close.
                 let _ = push_frame(&handle, &mut seq, &run_id,
-                    &sse::chat_error(&run_id, "run deadline exceeded", Some("deadline")));
+                    &sse::chat_error(&run_id, "run deadline exceeded", Some("deadline")),
+                    trace.as_ref());
                 break;
             }
             _ = heartbeat.tick() => {
@@ -453,11 +466,17 @@ async fn run_driver(
             ev = ev_rx.recv() => {
                 match ev {
                     Some(StreamEvent::Chat(c)) if c.state == ChatState::Final => {
-                        let _ = push_frame(&handle, &mut seq, &run_id, &StreamEvent::Chat(c));
+                        let _ = push_frame(
+                            &handle,
+                            &mut seq,
+                            &run_id,
+                            &StreamEvent::Chat(c),
+                            trace.as_ref(),
+                        );
                         break;
                     }
                     Some(event) => {
-                        match push_frame(&handle, &mut seq, &run_id, &event) {
+                        match push_frame(&handle, &mut seq, &run_id, &event, trace.as_ref()) {
                             PushOutcome::Ok => {}
                             PushOutcome::Disconnect | PushOutcome::Terminate => break,
                         }
@@ -485,13 +504,15 @@ async fn run_driver(
                                 match o.final_text {
                                     Some(text) => {
                                         let _ = push_frame(&handle, &mut seq, &run_id,
-                                            &sse::chat_final(&run_id, text));
+                                            &sse::chat_final(&run_id, text),
+                                            trace.as_ref());
                                     }
                                     None => {
                                         let _ = push_frame(&handle, &mut seq, &run_id,
                                             &sse::chat_error(&run_id,
                                                 "engine exited without final text",
-                                                Some("runtime_error")));
+                                                Some("runtime_error")),
+                                            trace.as_ref());
                                     }
                                 }
                             }
@@ -509,13 +530,15 @@ async fn run_driver(
                                         &mut seq,
                                         &run_id,
                                         &sse::chat_aborted(&run_id, &handle.abort_stop_reason()),
+                                        trace.as_ref(),
                                     );
                                 }
                             }
                             Err(e) => {
                                 let _ = push_frame(&handle, &mut seq, &run_id,
                                     &sse::chat_error(&run_id, &e.to_string(),
-                                        Some("runtime_error")));
+                                        Some("runtime_error")),
+                                    trace.as_ref());
                             }
                         }
                         break;
@@ -554,7 +577,13 @@ async fn run_driver(
 /// signal termination — never emit an oversize frame.
 ///
 /// Synchronous (no `.await`) — the buffer mutex is never held across an await.
-fn push_frame(handle: &RunHandle, seq: &mut u64, run_id: &str, ev: &StreamEvent) -> PushOutcome {
+fn push_frame(
+    handle: &RunHandle,
+    seq: &mut u64,
+    run_id: &str,
+    ev: &StreamEvent,
+    trace: Option<&TraceContext>,
+) -> PushOutcome {
     *seq += 1;
     let ts = now_ms();
     let frame = match event_to_frame(ev, *seq, ts, run_id) {
@@ -572,6 +601,10 @@ fn push_frame(handle: &RunHandle, seq: &mut u64, run_id: &str, ev: &StreamEvent)
         }
         Err(_) => return PushOutcome::Terminate,
     };
+    if let Some(trace) = trace {
+        trace.record_converted(ev, *seq);
+        trace.record_sse(*seq, &frame);
+    }
     if push_raw(handle, &frame) {
         PushOutcome::Ok
     } else {

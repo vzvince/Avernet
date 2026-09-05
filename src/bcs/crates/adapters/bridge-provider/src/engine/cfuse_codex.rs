@@ -191,7 +191,7 @@ impl Engine for CfuseCodex {
         }
         args.push(req.prompt.clone());
 
-        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[])
+        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[], req.trace.clone())
             .await
             .map_err(TurnError::Spawn)?;
         // prompt 已在 argv；codex exec 会把 piped stdin 当额外输入读，

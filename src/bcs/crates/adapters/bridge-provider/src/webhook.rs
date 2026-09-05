@@ -26,15 +26,31 @@ pub struct AppState {
     pub sessions: crate::session::SessionStore,
     pub runs: RunRegistry,
     pub interactions: crate::interaction::InteractionRegistry,
+    pub trace: Option<Arc<crate::engine::trace::TraceStore>>,
 }
 impl AppState {
     pub fn new(config: ProviderConfig) -> Self {
+        let trace = config.trace_dir.as_deref().and_then(|dir| {
+            match crate::engine::trace::TraceStore::open(dir) {
+                Ok(trace) => Some(trace),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "bridge_provider::trace",
+                        path = %dir.display(),
+                        error = %error,
+                        "failed to open bridge trace directory; tracing disabled"
+                    );
+                    None
+                }
+            }
+        });
         Self {
             config,
             idem: crate::idempotency::IdempotencyLedger::new(),
             sessions: crate::session::SessionStore::new(),
             runs: RunRegistry::new(),
             interactions: crate::interaction::InteractionRegistry::new(),
+            trace,
         }
     }
 }

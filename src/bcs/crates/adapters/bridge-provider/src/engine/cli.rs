@@ -2,10 +2,13 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
+use super::trace::TraceContext;
+
 pub struct CliSession {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<tokio::process::ChildStdout>,
+    trace: Option<TraceContext>,
 }
 
 impl CliSession {
@@ -14,6 +17,7 @@ impl CliSession {
         args: &[String],
         cwd: &Path,
         env: &[(String, String)],
+        trace: Option<TraceContext>,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(bin);
         cmd.args(args)
@@ -34,6 +38,7 @@ impl CliSession {
             .stderr
             .take()
             .ok_or_else(|| io_err("stderr not piped"))?;
+        let stderr_trace = trace.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(&mut stderr);
             let mut line = String::new();
@@ -41,7 +46,16 @@ impl CliSession {
                 line.clear();
                 match reader.read_line(&mut line).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => tracing::debug!(target: "bridge_provider::engine", stderr = line.trim_end()),
+                    Ok(_) => {
+                        let line = line.trim_end();
+                        if let Some(trace) = &stderr_trace {
+                            trace.record_stderr(line);
+                        }
+                        tracing::debug!(
+                            target: "bridge_provider::engine",
+                            stderr = super::trace::strip_ansi(line)
+                        );
+                    }
                 }
             }
         });
@@ -49,6 +63,7 @@ impl CliSession {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            trace,
         })
     }
 
@@ -77,6 +92,9 @@ impl CliSession {
         let n = self.stdout.read_line(&mut line).await?;
         if n == 0 {
             return Ok(None);
+        }
+        if let Some(trace) = &self.trace {
+            trace.record_raw(line.trim_end_matches(['\n', '\r']));
         }
         Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
     }
@@ -153,6 +171,7 @@ mod tests {
             &[script.to_string()],
             Path::new("."),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -170,6 +189,7 @@ mod tests {
             &[script.to_string()],
             Path::new("."),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -191,6 +211,7 @@ mod tests {
             &[script.to_string()],
             Path::new("."),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -213,6 +234,7 @@ mod tests {
             &[script.to_string()],
             Path::new("."),
             &[],
+            None,
         )
         .await
         .unwrap();

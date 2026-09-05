@@ -18,9 +18,9 @@
 //! terminal boundary.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use bcs_protocol::stream::StreamEvent;
+use bcs_protocol::stream::{StreamEvent, ToolData, ToolPhase};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +58,7 @@ impl Engine for CfuseCodexAppServer {
             "--listen".to_string(),
             "stdio://".to_string(),
         ];
-        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[])
+        let mut cli = CliSession::spawn(&self.bin, &args, &req.cwd, &[], req.trace.clone())
             .await
             .map_err(TurnError::Spawn)?;
 
@@ -77,6 +77,7 @@ impl Engine for CfuseCodexAppServer {
                 },
                 "capabilities": null,
             }),
+            &abort,
         )
         .await?;
         send_notification(&mut cli, "initialized", Value::Null).await?;
@@ -88,6 +89,7 @@ impl Engine for CfuseCodexAppServer {
                 &mut backlog,
                 "thread/resume",
                 thread_resume_params(&req, session_id),
+                &abort,
             )
             .await?
         } else {
@@ -97,6 +99,7 @@ impl Engine for CfuseCodexAppServer {
                 &mut backlog,
                 "thread/start",
                 thread_start_params(&req),
+                &abort,
             )
             .await?
         };
@@ -110,6 +113,7 @@ impl Engine for CfuseCodexAppServer {
             &mut backlog,
             "turn/start",
             turn_start_params(&req, &thread_id),
+            &abort,
         )
         .await?;
         let turn_id = extract_turn_id(&turn).ok_or_else(|| {
@@ -117,6 +121,7 @@ impl Engine for CfuseCodexAppServer {
         })?;
 
         let mut deltas = String::new();
+        let mut thinking = String::new();
         loop {
             let value = tokio::select! {
                 _ = abort.cancelled() => {
@@ -138,21 +143,56 @@ impl Engine for CfuseCodexAppServer {
                 "item/agentMessage/delta" | "agent/output_chunk" => {
                     if let Some(delta) = extract_delta(&value) {
                         deltas.push_str(&delta);
-                        if events.send(sse::chat_delta(&req.run_id, &delta)).await.is_err() {
+                        if send_event(&events, sse::chat_delta(&req.run_id, &delta)).await {
                             cli.kill().await;
                             return Err(TurnError::Aborted);
                         }
                     }
                 }
                 "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                    if let Some(delta) = extract_delta(&value)
-                        && events
-                            .send(sse::agent_thinking(&req.run_id, Some(delta), None))
-                            .await
-                            .is_err()
-                    {
-                        cli.kill().await;
-                        return Err(TurnError::Aborted);
+                    if let Some(delta) = extract_delta(&value) {
+                        thinking.push_str(&delta);
+                        if send_event(
+                            &events,
+                            sse::agent_thinking(
+                                &req.run_id,
+                                Some(delta),
+                                Some(thinking.clone()),
+                            ),
+                        )
+                        .await
+                        {
+                            cli.kill().await;
+                            return Err(TurnError::Aborted);
+                        }
+                    }
+                }
+                "item/started" => {
+                    if let Some(event) = map_item_started(&value, &req.run_id, &req.cwd) {
+                        if send_event(&events, event).await {
+                            return Err(TurnError::Aborted);
+                        }
+                    }
+                }
+                "item/completed" => {
+                    if let Some(event) = map_item_completed(&value, &req.run_id, &req.cwd) {
+                        if send_event(&events, event).await {
+                            return Err(TurnError::Aborted);
+                        }
+                    }
+                }
+                "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+                    if let Some(event) = map_tool_output_delta(&value, &req.run_id) {
+                        if send_event(&events, event).await {
+                            return Err(TurnError::Aborted);
+                        }
+                    }
+                }
+                "item/mcpToolCall/progress" => {
+                    if let Some(event) = map_mcp_progress(&value, &req.run_id) {
+                        if send_event(&events, event).await {
+                            return Err(TurnError::Aborted);
+                        }
                     }
                 }
                 "turn/completed" | "agent/turn_completed" => {
@@ -181,12 +221,169 @@ impl Engine for CfuseCodexAppServer {
     }
 }
 
+/// Send one converted event and return `true` when the downstream BCS sender
+/// has gone away. The caller kills the engine and ends the turn in that case.
+async fn send_event(
+    events: &Sender<StreamEvent>,
+    event: StreamEvent,
+) -> bool {
+    events.send(event).await.is_err()
+}
+
+fn map_item_started(value: &Value, run_id: &str, cwd: &Path) -> Option<StreamEvent> {
+    let item = value.get("params")?.get("item")?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let tool_call_id = item.get("id").and_then(Value::as_str)?.to_string();
+    let name = tool_item_name(item, item_type)?;
+    Some(sse::agent_tool(
+        run_id,
+        ToolData {
+            phase: ToolPhase::Start,
+            name: Some(name),
+            tool_call_id: Some(tool_call_id),
+            is_error: None,
+            exit_code: None,
+            duration_ms: None,
+            cwd: Some(item_string(item, "cwd").unwrap_or_else(|| cwd.to_string_lossy().into_owned())),
+            args: Some(tool_item_args(item, item_type, cwd)),
+            result: None,
+            partial_result: None,
+        },
+    ))
+}
+
+fn map_item_completed(value: &Value, run_id: &str, cwd: &Path) -> Option<StreamEvent> {
+    let item = value.get("params")?.get("item")?;
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let tool_call_id = item.get("id").and_then(Value::as_str)?.to_string();
+    let status = item.get("status").and_then(Value::as_str);
+    let is_error = status.is_some_and(|value| value != "completed")
+        || item
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value != 0)
+        || item.get("success").and_then(Value::as_bool) == Some(false);
+    let name = tool_item_name(item, item_type)?;
+    let result = if item_type == "commandExecution" {
+        item.get("aggregatedOutput")
+            .cloned()
+            .unwrap_or(Value::String(String::new()))
+    } else {
+        item.get("result")
+            .cloned()
+            .or_else(|| item.get("contentItems").cloned())
+            .or_else(|| item.get("error").cloned())
+            .unwrap_or(Value::Null)
+    };
+    Some(sse::agent_tool(
+        run_id,
+        ToolData {
+            phase: ToolPhase::Result,
+            name: Some(name),
+            tool_call_id: Some(tool_call_id),
+            is_error: Some(is_error),
+            exit_code: item.get("exitCode").and_then(Value::as_i64),
+            duration_ms: item.get("durationMs").and_then(Value::as_u64),
+            cwd: item_string(item, "cwd"),
+            args: Some(tool_item_args(item, item_type, cwd)),
+            result: Some(result),
+            partial_result: None,
+        },
+    ))
+}
+
+fn map_tool_output_delta(value: &Value, run_id: &str) -> Option<StreamEvent> {
+    let params = value.get("params")?;
+    let delta = params.get("delta").and_then(Value::as_str)?;
+    Some(sse::agent_tool(
+        run_id,
+        ToolData {
+            phase: ToolPhase::Update,
+            name: None,
+            tool_call_id: params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            is_error: Some(false),
+            exit_code: None,
+            duration_ms: None,
+            cwd: None,
+            args: None,
+            result: None,
+            partial_result: Some(Value::String(delta.to_string())),
+        },
+    ))
+}
+
+fn map_mcp_progress(value: &Value, run_id: &str) -> Option<StreamEvent> {
+    let params = value.get("params")?;
+    let partial = params
+        .get("message")
+        .cloned()
+        .or_else(|| params.get("delta").cloned())
+        .unwrap_or_else(|| params.clone());
+    Some(sse::agent_tool(
+        run_id,
+        ToolData {
+            phase: ToolPhase::Update,
+            name: None,
+            tool_call_id: params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            is_error: Some(false),
+            exit_code: None,
+            duration_ms: None,
+            cwd: None,
+            args: None,
+            result: None,
+            partial_result: Some(partial),
+        },
+    ))
+}
+
+fn item_string(item: &Value, key: &str) -> Option<String> {
+    item.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn mcp_tool_name(item: &Value) -> String {
+    let server = item_string(item, "server").unwrap_or_else(|| "mcp".into());
+    let tool = item_string(item, "tool").unwrap_or_else(|| "tool".into());
+    format!("mcp__{server}__{tool}")
+}
+
+fn tool_item_name(item: &Value, item_type: &str) -> Option<String> {
+    match item_type {
+        "commandExecution" => Some("Bash".into()),
+        "mcpToolCall" => Some(mcp_tool_name(item)),
+        "dynamicToolCall" => Some("dynamicTool".into()),
+        "fileChange" => Some("FileChange".into()),
+        "webSearch" => Some("WebSearch".into()),
+        _ => None,
+    }
+}
+
+fn tool_item_args(item: &Value, item_type: &str, cwd: &Path) -> Value {
+    match item_type {
+        "commandExecution" => json!({
+            "command": item.get("command").cloned().unwrap_or(Value::Null),
+            "cwd": item.get("cwd").cloned().unwrap_or_else(|| json!(cwd)),
+        }),
+        "mcpToolCall" | "dynamicToolCall" => item
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => item.clone(),
+    }
+}
+
 async fn rpc_call(
     cli: &mut CliSession,
     next_id: &mut u64,
     backlog: &mut VecDeque<Value>,
     method: &str,
     params: Value,
+    abort: &CancellationToken,
 ) -> Result<Value, TurnError> {
     let id = *next_id;
     *next_id = next_id.saturating_add(1);
@@ -198,22 +395,52 @@ async fn rpc_call(
     });
     send_line(cli, &request).await?;
 
+    // Notifications may arrive before the response we are waiting for (the
+    // real Codex app-server emits config/status notifications around
+    // thread/start). Look for the response in the backlog without letting an
+    // unrelated notification at the front prevent us from reading stdout.
+    if let Some(index) = backlog
+        .iter()
+        .position(|value| value.get("id").and_then(Value::as_u64) == Some(id))
+    {
+        let Some(value) = backlog.remove(index) else {
+            return Err(TurnError::Protocol(
+                "app-server response backlog changed while resolving RPC response".into(),
+            ));
+        };
+        return decode_rpc_response(value, method);
+    }
+
     loop {
-        let value = next_message(cli, backlog).await?;
+        // Read the live stdout stream directly here. `next_message` consumes
+        // the notification backlog first, which is correct while driving the
+        // turn but would repeatedly return the same unrelated notification
+        // while this RPC call is waiting for a later response.
+        let value = tokio::select! {
+            _ = abort.cancelled() => return Err(TurnError::Aborted),
+            value = next_live_message(cli) => value?,
+        };
         if value.get("id").and_then(Value::as_u64) == Some(id) {
-            if let Some(error) = value.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("app-server RPC failed");
-                return Err(TurnError::EngineExited(sanitize_message(message)));
-            }
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            return decode_rpc_response(value, method);
         }
         if value.get("method").is_some() {
             backlog.push_back(value);
         }
     }
+}
+
+fn decode_rpc_response(value: Value, method: &str) -> Result<Value, TurnError> {
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("app-server RPC failed");
+        return Err(TurnError::EngineExited(format!(
+            "{method}: {}",
+            sanitize_message(message)
+        )));
+    }
+    Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn send_notification(
@@ -245,6 +472,10 @@ async fn next_message(
     if let Some(value) = backlog.pop_front() {
         return Ok(value);
     }
+    next_live_message(cli).await
+}
+
+async fn next_live_message(cli: &mut CliSession) -> Result<Value, TurnError> {
     let Some(line) = cli.next_line().await.map_err(TurnError::Io)? else {
         return Err(TurnError::EngineExited(
             "app-server stdout EOF before result".into(),

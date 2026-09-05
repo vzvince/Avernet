@@ -2,6 +2,7 @@ pub mod cfuse_cc;
 pub mod cfuse_codex;
 pub mod cfuse_codex_app_server;
 pub mod cli;
+pub mod trace;
 pub mod transcript;
 
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ pub struct TurnRequest {
     pub cfuse_bin: PathBuf,
     pub permission_mode: Option<String>,
     pub interactions: InteractionRegistry,
+    pub trace: Option<trace::TraceContext>,
 }
 
 /// Outcome of an engine turn: the engine-internal session id (if one was
@@ -127,6 +129,7 @@ mod tests {
             run_id: "r-1".into(), prompt: "hi".into(), engine_session_id: None,
             cwd: ".".into(), model: None, cfuse_bin: "cfuse".into(), permission_mode: None,
             interactions: InteractionRegistry::new(),
+            trace: None,
         };
         let outcome = engine.run_turn(req, tx, tokio_util::sync::CancellationToken::new()).await.unwrap();
         assert_eq!(outcome.engine_session_id.as_deref(), Some("e-1"));
