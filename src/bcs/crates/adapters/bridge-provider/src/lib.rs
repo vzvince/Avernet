@@ -5,6 +5,7 @@ pub mod idempotency;
 pub mod interaction;
 pub mod run;
 pub mod session;
+mod session_db;
 pub mod sse;
 pub mod webhook;
 

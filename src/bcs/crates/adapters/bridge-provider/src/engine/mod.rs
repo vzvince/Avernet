@@ -3,7 +3,6 @@ pub mod cfuse_codex;
 pub mod cfuse_codex_app_server;
 pub mod cli;
 pub mod trace;
-pub mod transcript;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,12 +25,20 @@ pub struct TurnRequest {
     pub run_id: String,
     pub prompt: String,
     pub engine_session_id: Option<String>,
+    pub session_observer: Arc<dyn SessionObserver>,
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub cfuse_bin: PathBuf,
     pub permission_mode: Option<String>,
     pub interactions: InteractionRegistry,
     pub trace: Option<trace::TraceContext>,
+}
+
+/// Internal lifecycle notification. Await durable acknowledgement as soon as
+/// the engine creates/resumes a session, even if the turn subsequently fails.
+#[async_trait::async_trait]
+pub trait SessionObserver: Send + Sync {
+    async fn established(&self, engine_session_id: &str) -> Result<(), String>;
 }
 
 /// Outcome of an engine turn: the engine-internal session id (if one was
@@ -48,6 +55,8 @@ pub struct TurnOutcome {
 /// from [`std::io::Error`] via `?` for the driver's read/write paths.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnError {
+    #[error("session persistence failed: {0}")]
+    SessionStorage(String),
     #[error("spawn engine: {0}")]
     Spawn(std::io::Error),
     #[error("engine exited: {0}")]
@@ -86,15 +95,14 @@ pub fn build_engine(bot: &BotConfig) -> Arc<dyn Engine> {
     }
 }
 
-/// Validate an engine-native session id before it is used as a transcript path
-/// component (`<engine_session_id>.jsonl`) or a `--resume`/`exec resume` argv
+/// Validate an engine-native session id before it is persisted or used as a
+/// `--resume`/`exec resume` argv
 /// argument. An engine must never be a trusted source for these — a buggy or
 /// hostile engine could supply `../../evil` (path traversal) or `--evil`
 /// (argv option injection). Rules: non-empty; no leading dash (argv option
 /// guard); no path separators or parent refs; only ascii alphanumeric plus
 /// `-`/`_`/`.`. The two engine drivers call this at their capture sites (cc
-/// `system/init`, codex `thread.started`); an invalid id is logged and treated
-/// as no session (not persisted, not resumed, transcript sink skipped).
+/// `system/init`, codex `thread.started`); invalid ids must not be persisted or resumed.
 pub(crate) fn is_valid_engine_session_id(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('-')
@@ -109,6 +117,11 @@ mod tests {
     use bcs_protocol::stream::StreamEvent;
 
     struct FakeEngine;
+    struct TestObserver;
+    #[async_trait::async_trait]
+    impl SessionObserver for TestObserver {
+        async fn established(&self, _: &str) -> Result<(), String> { Ok(()) }
+    }
     #[async_trait::async_trait]
     impl Engine for FakeEngine {
         fn kind(&self) -> EngineKind { EngineKind::CfuseCc }
@@ -128,6 +141,7 @@ mod tests {
         let req = TurnRequest {
             run_id: "r-1".into(), prompt: "hi".into(), engine_session_id: None,
             cwd: ".".into(), model: None, cfuse_bin: "cfuse".into(), permission_mode: None,
+            session_observer: Arc::new(TestObserver),
             interactions: InteractionRegistry::new(),
             trace: None,
         };

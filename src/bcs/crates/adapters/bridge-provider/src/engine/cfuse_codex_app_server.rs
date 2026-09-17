@@ -106,6 +106,10 @@ impl Engine for CfuseCodexAppServer {
         let thread_id = extract_thread_id(&thread).ok_or_else(|| {
             TurnError::Protocol(format!("app-server thread response missing thread.id: {thread}"))
         })?;
+        if !crate::engine::is_valid_engine_session_id(&thread_id) {
+            return Err(TurnError::Protocol("app-server supplied invalid thread id".into()));
+        }
+        req.session_observer.established(&thread_id).await.map_err(TurnError::SessionStorage)?;
 
         let turn = rpc_call(
             &mut cli,

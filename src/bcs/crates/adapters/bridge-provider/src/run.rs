@@ -323,34 +323,19 @@ pub fn body_fingerprint(req: &DownstreamRequest, session_id: &str) -> String {
     crate::idempotency::fingerprint(&[&msg, session_id, &req.to_bot.provider_bot_ref])
 }
 
-/// Prompt assembly for a turn: pending injects (drained FIFO) prepend each as
-/// `[from:{name}] {text}` (or bare `{text}` when `from_name` is `None`), then a
-/// blank separator, then the user message text — `message.content[].text`
-/// joined with `\n`. Two injects + body thus render as:
-///
-/// ```text
-/// [from:张三] 注入的消息一
-/// 注入的消息二
-///
-/// <本次 message 文本>
-/// ```
-///
-/// The blank line marks where the inject block ends and the current request
-/// begins — visible separation that downstream prompts read as context vs ask.
-/// The pending-inject prepend is the codex fallback (no transcript sink): an
-/// inject that could not be sunk to the engine transcript lives in
-/// `pending_injects` and is drained here on the next chat.send. UTF-8 safe —
-/// no byte slicing.
+/// Reserve a durable inject batch and prepend it FIFO to this turn's input.
+/// Reservation does not delete messages: only successful engine completion
+/// acknowledges them; failures and restarts leave them eligible for retry.
 async fn assemble_prompt(
     state: &AppState,
     bot: &BotConfig,
     session_id: &str,
     req: &DownstreamRequest,
-) -> String {
+) -> Result<String, crate::session::SessionError> {
     let injects = state
         .sessions
-        .take_pending_injects(&bot.provider_bot_ref, session_id)
-        .await;
+        .claim_injects(&bot.provider_bot_ref, session_id, &req.id)
+        .await?;
     let mut prefix = String::new();
     for inj in &injects {
         if !prefix.is_empty() {
@@ -362,17 +347,17 @@ async fn assemble_prompt(
         }
     }
     let body = extract_message_text(req.message.as_ref());
-    if prefix.is_empty() {
+    Ok(if prefix.is_empty() {
         body
     } else {
         format!("{prefix}\n\n{body}")
-    }
+    })
 }
 
 /// Extract `message.content[].text` and join multiple parts with `\n`. Missing
 /// fields yield an empty string (validated upstream). Reused by the chat.inject
 /// handler to flatten the inject body into the [`crate::session::InjectedMessage`]
-/// text field, so the pending-prepend and transcript-sink paths see one string.
+/// text field used by the durable inject queue.
 pub(crate) fn extract_message_text(message: Option<&serde_json::Value>) -> String {
     let Some(msg) = message else { return String::new() };
     let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
@@ -400,19 +385,33 @@ async fn run_driver(
     let run_id = req.id.clone();
     let timeout_ms = req.timeout_ms.unwrap_or(3_600_000);
 
-    // Resume an established engine-internal session if one was recorded.
-    let engine_session_id = state
-        .sessions
-        .mapping(&bot.provider_bot_ref, &session_id)
-        .await
-        .engine_session_id;
-
-    let prompt = assemble_prompt(&state, &bot, &session_id, &req).await;
+    let prepared = async {
+        let engine_session_id = state.sessions.mapping(&bot.provider_bot_ref, &session_id).await?.engine_session_id;
+        let prompt = assemble_prompt(&state, &bot, &session_id, &req).await?;
+        Ok::<_, crate::session::SessionError>((engine_session_id, prompt))
+    }.await;
+    let (engine_session_id, prompt) = match prepared {
+        Ok(turn) => turn,
+        Err(error) => {
+            tracing::error!(%error, %run_id, bcs_session_id = %session_id, "cannot prepare durable session");
+            let mut seq = 0;
+            let _ = push_frame(&handle, &mut seq, &run_id,
+                &sse::chat_error(&run_id, &error.to_string(), Some("session_store_error")), None);
+            handle.terminal.store(true, Ordering::SeqCst);
+            state.runs.finish(&run_id);
+            state.sessions.finish_run(&bot.provider_bot_ref, &session_id, &run_id).await;
+            return;
+        }
+    };
+    tracing::info!(provider_id = %state.config.provider_id, provider_bot_ref = %bot.provider_bot_ref,
+        bcs_session_id = %session_id, %run_id, engine_session_id = ?engine_session_id,
+        resume = engine_session_id.is_some(), "starting engine turn");
 
     let turn_req = TurnRequest {
         run_id: run_id.clone(),
         prompt,
         engine_session_id,
+        session_observer: state.sessions.observer(&bot.provider_bot_ref, &session_id, &run_id),
         cwd: bot.cwd.clone(),
         model: bot.model.clone(),
         cfuse_bin: bot.cfuse_bin.clone().unwrap_or_else(|| PathBuf::from("cfuse")),
@@ -440,6 +439,7 @@ async fn run_driver(
         }));
 
     let mut seq: u64 = 0;
+    let mut injects_completed = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Self-terminate ~30s ahead of the hard deadline so a terminal chat_error can
@@ -466,6 +466,12 @@ async fn run_driver(
             ev = ev_rx.recv() => {
                 match ev {
                     Some(StreamEvent::Chat(c)) if c.state == ChatState::Final => {
+                        if let Err(error) = state.sessions.complete_injects(&bot.provider_bot_ref, &session_id, &run_id).await {
+                            let _ = push_frame(&handle, &mut seq, &run_id,
+                                &sse::chat_error(&run_id, &error.to_string(), Some("session_store_error")), trace.as_ref());
+                            break;
+                        }
+                        injects_completed = true;
                         let _ = push_frame(
                             &handle,
                             &mut seq,
@@ -497,12 +503,21 @@ async fn run_driver(
                         match outcome {
                             Ok(o) => {
                                 if let Some(sid) = o.engine_session_id {
-                                    state.sessions
-                                        .set_engine_session_id(&bot.provider_bot_ref, &session_id, &sid)
-                                        .await;
+                                    if let Err(error) = state.sessions
+                                        .set_engine_session_id(&bot.provider_bot_ref, &session_id, &sid).await {
+                                        let _ = push_frame(&handle, &mut seq, &run_id,
+                                            &sse::chat_error(&run_id, &error.to_string(), Some("session_store_error")), trace.as_ref());
+                                        break;
+                                    }
                                 }
                                 match o.final_text {
                                     Some(text) => {
+                                        if let Err(error) = state.sessions.complete_injects(&bot.provider_bot_ref, &session_id, &run_id).await {
+                                            let _ = push_frame(&handle, &mut seq, &run_id,
+                                                &sse::chat_error(&run_id, &error.to_string(), Some("session_store_error")), trace.as_ref());
+                                            break;
+                                        }
+                                        injects_completed = true;
                                         let _ = push_frame(&handle, &mut seq, &run_id,
                                             &sse::chat_final(&run_id, text),
                                             trace.as_ref());
@@ -563,6 +578,13 @@ async fn run_driver(
     handle.abort.cancel();
     if let Some(h) = engine_handle.take() {
         let _ = h.await;
+    }
+    if !injects_completed {
+        if let Err(error) = state.sessions.release_injects(&bot.provider_bot_ref, &session_id, &run_id).await {
+            // This run already failed or disconnected. Preserve the original
+            // terminal event; durable inflight rows are reclaimed next time.
+            tracing::error!(%error, %run_id, bcs_session_id = %session_id, "failed to release inject batch");
+        }
     }
     handle.terminal.store(true, Ordering::SeqCst);
     state.runs.finish(&run_id);

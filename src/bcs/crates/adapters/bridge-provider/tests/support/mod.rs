@@ -6,17 +6,21 @@ pub async fn spawn_app(toml_text: &str) -> String {
 }
 
 /// 与 [`spawn_app`] 同样起服务，但额外返回共享的 [`AppState`] 句柄，供测试
-/// 直接编排会话状态（例如预置 `engine_session_id`、排空 `pending_injects`）。
+/// 直接编排会话状态（例如检查会话持久化状态）。
 pub async fn spawn_app_with_state(toml_text: &str) -> (String, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bridge.toml");
-    std::fs::write(&path, toml_text).unwrap();
+    // Each test owns its database; never use the developer's home default.
+    let mut document: toml::Value = toml::from_str(toml_text).unwrap();
+    document.as_table_mut().unwrap().entry("state_path")
+        .or_insert_with(|| toml::Value::String(dir.path().join("bridge-state.sqlite3").to_string_lossy().into_owned()));
+    std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
     let config = ProviderConfig::load(&path).unwrap();
     // tempdir 不能 drop：泄漏到测试生命周期结束即可（测试进程退出清理）
     std::mem::forget(dir);
     let mut cfg = config;
     cfg.listen = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-    let state = Arc::new(AppState::new(cfg));
+    let state = Arc::new(AppState::new(cfg).unwrap());
     let app = webhook::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

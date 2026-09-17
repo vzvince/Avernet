@@ -60,7 +60,7 @@ BCS 已支持下行调用模式，并定义了标准的 Provider 2.0 SSE 协议
 | 引擎抽象命名 | trait `Engine` + `enum EngineKind` | 否决：`AgentProvider`（BCN 已占用 Provider=本桥）、`AgentBridge`（bridge=整体组件名）、`AgentBackend`（与本仓 `src/backend` 服务冲突）、`AgentEngine`（agent≈engine 同义重复）、`EngineDriver`（driver=BCS 群组角色）；`bcs-protocol` 已有 `EngineType`（bot 平台类型），故枚举名用 `EngineKind` |
 | v1 方法集 | `chat.send`(SSE)、`chat.inject`、`chat.abort`、`interaction.resolve`、`bot.ping` | 用户明确要求交互必须支持；`chat.history` 不做 |
 | 交互（HITL） | 必须支持；引擎以交互模式运行 | 不做 yolo/自动批准；v1 支持 `exec` + `ask_user`，`mode_switch` 不合成（协议标记为可选能力，cfuse 无双向模式切换语义） |
-| inject 处理 | session store 为事实源 + 引擎原生 transcript sink | 仿 aix-relay `sessions/inject.rs`：cc 写 Claude session JSONL；codex 格式待实现期确认，降级方案为下次 send 前置注入 |
+| inject 处理 | SQLite 持久队列，下一次 send 按序合并 | CC/Codex 统一路径；删除原生 transcript sink，不读写引擎历史文件 |
 | BCS 断连 | **写失败即杀 run**（修正项） | 协议文档 §1.3 明确无重连/续传，EOF 后 BCS 已合成 terminal error，保活无意义。引擎 transcript 仍在，BCS 后续新 run 可 resume |
 | 同 session 并发 chat.send | `429 rate_limited`（retryable） | 引擎会话天然串行；v1 不排队 |
 | 幂等重挂 | 每 run 内存 frame buffer，重放自 seq 1 + live follow | 仅服务"首个响应丢失后 BCS 同 id 重试"窗口；BCS 按 seq 去重，重放无害 |
@@ -83,7 +83,7 @@ fallback 需要）、`bcs-protocol`（SSE 流类型）。
 ```text
 POST /webhook ──→ WebhookServer ──→ Dispatcher(按 method)
                       │                ├─ chat.send ──→ RunRegistry ──→ Engine(经 CliSession)
-                      │                ├─ chat.inject ─→ SessionStore (+ TranscriptSink)
+                      │                ├─ chat.inject ─→ SessionStore (SQLite queue)
                       │                ├─ chat.abort ──→ RunRegistry.abort
                       │                ├─ interaction.resolve ─→ InteractionRegistry
                       │                └─ bot.ping ──→ 引擎可用性探针
@@ -143,16 +143,13 @@ Engine stdout ──→ EventMapper ──→ SseEncoder(seq/buffer) ──→ S
    （per-run 单调，自 1 起，跨 chat/agent/interaction 共享），SSE `id:` 镜像
    `seq`；帧 ≤ 8 MiB；UTF-8 安全切分（`char_indices`，禁止字节切片——
    CLAUDE.md 硬性要求）。
-5. **SessionStore**（进程内存）：键 `(provider_bot_ref, bcs_session_id)`。
-
-   ```rust
-   struct SessionMapping {
-       bcs_session_id: BcsSessionId,
-       engine_session_id: Option<EngineSessionId>, // 首 turn 从引擎流捕获，之后用于 --resume
-       pending_injects: Vec<InjectedMessage>,      // transcript sink 不可用时待注入
-       active_run: Option<RunId>,
-   }
-   ```
+5. **SessionStore**（SQLite 持久状态 + 进程内 run 占用）：键
+   `(provider_id, provider_bot_ref, bcs_session_id)`。持久保存引擎类型、规范化
+   cwd 与 `engine_session_id`，运行占用仅在内存，重启后不恢复。
+   首次捕获 CC `system/init` 或 Codex app-server `thread/start|resume` 的
+   session/thread ID 后，通过内部 `SessionObserver` 等待提交成功再继续处理；
+   不依赖本轮成功完成。已有会话的 engine/cwd 或原生 session ID 改变时报错，
+   不静默覆盖历史映射。数据库打开、迁移和写入错误必须向调用方传播。
 6. **RunRegistry**：活跃 run 与 grace 期内 terminal run；每 run 持有
    `buffer: Vec<Frame>`（重放用）、`live_tx: broadcast::Sender<Frame>`、
    `abort: CancellationToken`、`pending_interactions`。
@@ -160,9 +157,11 @@ Engine stdout ──→ EventMapper ──→ SseEncoder(seq/buffer) ──→ S
    公开 `interactionId` 由本桥铸造（run 内唯一不复用），引擎内部请求 id 不外泄；
    同时保存 resolve 回写引擎所需的 engine-native 关联信息（对齐协议文档 §11
    "Provider 在 requested 时保存 engine-native correlation"）。
-8. **TranscriptSink**（per-engine 可选）：把 inject 消息幂等追加进引擎原生
-   transcript（cc = Claude session JSONL，仿 aix-relay `ClaudeJsonlSink`：
-   leaf-linked、按 run_id 去重）；sink 永远不是 session 状态的第二事实源。
+8. **持久 inject 队列**：接收消息与幂等回执在同一事务提交后才 ACK。
+   消息在下一次 send 中按接收顺序前置合并，状态为
+   `pending → inflight(run_id) → delivered`。失败/取消后回到 pending；
+   重启恢复未确认的 inflight，等待下次 send，不自动启动引擎。
+   原 `TranscriptSink` 及 CC JSONL 追加逻辑已删除。
 9. **CallbackClient**（仅 JSON-ack fallback 路径用）：`POST /bot/events`。
    SSE 绑定的 run 禁止走它（BCS 会 409）。
 10. **ProviderConfig**：静态配置（见 §4.3），含 token 与 bot→引擎绑定。
@@ -174,6 +173,7 @@ provider_id = "bridge-provider-1"
 bcs_to_provider_token = { env = "BRIDGE_B2P_TOKEN" }
 bot_runtime_token = { env = "BRIDGE_BOT_RUNTIME_TOKEN" }  # callback fallback 用
 listen = "0.0.0.0:21100"
+# state_path = "~/.bcn-bridge/bridge-state.sqlite3"  # 可省略，默认使用用户目录
 
 [[bot]]
 provider_bot_ref = "cc-worker"
@@ -188,6 +188,18 @@ engine = "cfuse-codex"
 cwd = "/data/work/codex"
 ```
 
+`state_path` 可省略，默认 `~/.bcn-bridge/bridge-state.sqlite3`，启动时自动创建目录。
+显式 `~/` 路径也展开到运行 Bridge 的用户主目录；普通相对路径仍以配置文件
+目录为基准，绝对路径原样使用。无法定位主目录时要求显式配置路径，不回退到
+临时目录。数据库与 `.lock`/SQLite sidecar 属于本地运行数据，不提交到仓库；
+部署时应使用持久卷，并保留同一运行账号下的引擎原生历史。启动时持有数据库
+专用的 OS 文件锁，禁止两个 Bridge 实例同时使用同一个状态库。SQLite 使用
+WAL 和 FULL synchronous；日常操作在线程池执行，不阻塞 Tokio 的网络任务。
+
+首次从旧版升级不会自动推断旧内存映射，也不会合并已分散的历史；新建的映射
+从此持久化。需要延续升级前某个已知原生会话时，必须先明确对应关系再迁移，
+不得按目录里“最新的文件”猜测。
+
 ## 5. 线协议面（本桥实现侧）
 
 ### 5.1 方法表
@@ -195,7 +207,7 @@ cwd = "/data/work/codex"
 | method | transport | 行为 |
 | --- | --- | --- |
 | `chat.send` | SSE | 解析 bot→engine → 会话映射（resume 或新建）→ spawn → 流式转发 → terminal 关流 |
-| `chat.inject` | JSON | 写 SessionStore + TranscriptSink，**不触发引擎** → `200 {"ok":true}` |
+| `chat.inject` | JSON | 消息和去重回执提交 SQLite 后 ACK，**不触发引擎** → `200 {"ok":true}`；落盘失败 → 503 |
 | `chat.abort` | JSON | 按 `session_id` 反查活跃 run → 取消 → 其流上发 `aborted` 终态；响应形态见 §5.3 |
 | `interaction.resolve` | JSON | 按 `interactionId` 查 pending → 幂等（同 key 同 resolution 直接成功）→ 回写引擎控制通道 → 引擎应用后在原 SSE 发 `interaction/resolved` → ACK `{"ok":true}`；引擎暂不可写 → `{"ok":false,"retryable":true,"error":"..."}` |
 | `bot.ping` | JSON | `200 {"ok":true}` + 引擎 binary 可用性 |
@@ -250,7 +262,7 @@ cwd = "/data/work/codex"
 | 场景 | 键 | 行为 |
 | --- | --- | --- |
 | `chat.send` | body `id` | 活跃 run 同 body → 迁移/重挂流（buffer 自 seq 1 重放 + live follow）；terminal → 重放终态帧的单帧 SSE；异 body → 409 |
-| `chat.inject` | body `id` | 同键同 body 直接成功，不重复写 transcript |
+| `chat.inject` | `(provider_id, body.id)` | 完整 message/from 与 bot/session 一致则成功，不重复入队；有差异则 409；回执跨重启保留 |
 | `chat.abort` | body `id` | 重复 abort 同 terminal run 稳定 410 |
 | `interaction.resolve` | `params.idempotencyKey` | 同键同 resolution → 直接 ACK 成功，不重复回写引擎；引擎侧重复投递需容忍（协议 §8） |
 
@@ -266,15 +278,22 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
 
 1. 校验 + 幂等认领 → 按 `provider_bot_ref` 取 `EngineKind`/model/cwd →
    查 SessionMapping（有 `engine_session_id` 则 resume，无则新会话）→
-   取出 pending injects（transcript sink 不可用引擎的前置注入）。
+   在 SQLite 事务中认领待发 inject，按序合并到当前输入；消息不删除。
 2. 立即 `200 + Content-Type: text/event-stream` 应答（远早于 125s 响应头
    deadline），run task 持有该响应流。
 3. spawn 引擎（cfuse cc stream-json 或 codex app-server JSON-RPC I/O，交互权限模式）。
 4. 从引擎流捕获 engine session id → **立即持久化映射**（run 中途失败也保留下次
    resume 能力）。
 5. 引擎事件 → EventMapper → SseEncoder（赋 seq）→ 写 SSE + 入 run buffer。
-6. terminal（final/error/aborted）→ 关流、标记 Terminal、使该 run 全部
+6. 成功完成时，先提交本轮 inject 为 delivered，再发 final；CC
+   `is_error:true` 即使 subtype 为 success 也按失败处理，不能确认消费。
+   失败/取消后释放本轮 inject，随后 terminal（final/error/aborted）→ 关流、标记 Terminal、使该 run 全部
    Pending/Accepted interaction 失效、buffer 进 grace TTL（默认 10 min）后驱逐。
+
+投递采用 **至少一次** 语义：如果引擎已接收消息而 Bridge 尚未提交 delivered
+就崩溃，下一次 send 可能再次附带这些消息。状态库与引擎之间没有共同事务，
+不保证“恰好一次”，也不通过读写原生历史来猜测消费状态。运行期间新收到的
+inject 不加入已经认领的批次，留给下一轮；已 delivered 的回执继续用于去重。
 
 ### 6.3 Interaction 子流程
 
@@ -310,7 +329,7 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
 | BCS 断连（写失败） | SSE write error | **立即杀 run**（协议无重连续传；BCS 已合成 terminal error） |
 | 重复 chat.send（同 id 同 body） | 幂等台账 | 见 §5.5（重挂/重放） |
 | 同 session 并发第二个 chat.send | SessionMapping.active_run 占用 | `429 rate_limited`（retryable） |
-| bridge 进程重启 | — | 子进程同灭、run 全失；BCS 新 run 凭 Codex app-server `thread/resume` 或 cc transcript `--resume` 恢复上下文 |
+| bridge 进程重启 | — | run/交互/SSE buffer 不恢复；映射和 inject 回执保留，新 send 凭持久映射 `thread/resume` 或 `--resume` 恢复；未确认 inject 重投 |
 | interaction.resolve 指向未知 id | 查 registry | `{"ok":false,"retryable":false,"error":"unknown interaction"}` |
 | 单帧 > 8 MiB 风险 | encoder 侧检查 | 截断/降级为 error 帧（脱敏），不产生超限帧 |
 
@@ -341,7 +360,8 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
    双 id 映射（首 turn 捕获→后续 resume）、InteractionRegistry
    （resolve/超时兜底/abort 竞态/幂等键）、幂等台账。
 5. **UTF-8 专项**：中文 delta 跨帧切分必须走 `char_indices` 安全边界。
-6. **轻依赖**：`cargo test -p bridge-provider` 可在本 worktree 独立构建
+6. **持久化恢复**：真实 Bridge 进程 + SQLite + 本地 mock 引擎，覆盖成功/失败/取消/中断后的 resume、inject FIFO/去重/重投，以及写入错误和单实例锁。
+7. **轻依赖**：`cargo test -p bridge-provider` 可在本 worktree 独立构建
    （磁盘受限，不做全 workspace 构建）。
 
 ## 9. 非目标与未来工作
@@ -351,8 +371,8 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
 - `chat.history`：不做。
 - `mode_switch` interaction：不合成（协议允许 Provider 不声明该能力）。
 - A2A 出口层（让非 BCS 网络调用本桥引擎）：远期可选。
-- chat.send 排队（替代 429）、SessionStore/InteractionRegistry 持久化
-  （BCS 自身首版亦为进程内存）：按运行需要再做。
+- chat.send 排队（替代 429）、运行/交互/SSE buffer 的跨进程恢复：按运行需要再做。
+- inject 回执清理策略：当前保留 delivered 回执确保跨重启去重，需部署侧关注状态库增长。
 - cfuse `proxy` 模式（HTTP 常驻）替代 per-turn 子进程：实现期若并发/冷启动
   成为瓶颈再评估。
 

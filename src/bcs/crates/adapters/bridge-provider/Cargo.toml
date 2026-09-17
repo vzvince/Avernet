@@ -15,10 +15,12 @@ anyhow        = { workspace = true }
 async-trait   = { workspace = true }
 axum          = { workspace = true }
 bcs-protocol  = { workspace = true }
+dirs          = { workspace = true }
 libc          = "0.2"
 futures       = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+rusqlite      = { workspace = true }
 thiserror     = { workspace = true }
 tokio         = { workspace = true }
 tokio-stream  = { workspace = true }

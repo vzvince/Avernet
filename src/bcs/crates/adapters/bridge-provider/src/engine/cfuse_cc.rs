@@ -220,6 +220,9 @@ fn map_user(v: &Value, run_id: &str) -> CcMap {
 
 fn map_result(v: &Value) -> CcMap {
     let subtype = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("");
+    if v.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return CcMap::Failed("engine_result_error".into());
+    }
     if subtype == "success" {
         let text = v.get("result").and_then(|x| x.as_str()).unwrap_or("").to_string();
         return CcMap::Final(text);
@@ -603,21 +606,11 @@ impl Engine for CfuseCc {
                     };
                     match map_cc_line(&line, &req.run_id) {
                         CcMap::SessionId(s) => {
-                            // Validate before adopting: an engine-supplied id is
-                            // later used as a transcript path component and a
-                            // `--resume` argv argument, so it must be safe. An
-                            // invalid id is logged and treated as no session
-                            // (not persisted, not resumed, transcript sink skipped).
-                            if is_valid_engine_session_id(&s) {
-                                engine_session_id = Some(s);
-                            } else {
-                                tracing::warn!(
-                                    target: "bridge_provider",
-                                    session_id = %s,
-                                    "cc system/init supplied invalid session id; \
-                                     ignoring (not persisted/resumed)"
-                                );
+                            if !is_valid_engine_session_id(&s) {
+                                return Err(TurnError::Protocol("cc supplied invalid session id".into()));
                             }
+                            req.session_observer.established(&s).await.map_err(TurnError::SessionStorage)?;
+                            engine_session_id = Some(s);
                         }
                         CcMap::Events(evs) => for ev in evs {
                             if events.send(ev).await.is_err() {
@@ -727,6 +720,15 @@ mod tests {
         match map_cc_line(line, "r-1") {
             CcMap::Final(text) => assert_eq!(text, ""),
             other => panic!("expected Final, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_flag_does_not_acknowledge_a_successful_turn() {
+        let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"private upstream error"}"#;
+        match map_cc_line(line, "r-1") {
+            CcMap::Failed(note) => assert!(!note.contains("private upstream error")),
+            other => panic!("an error result must not consume pending injects: {other:?}"),
         }
     }
 

@@ -62,11 +62,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("bridge.toml"));
     let config = ProviderConfig::load(&config_path)?;
     let listen = config.listen;
-    let state = Arc::new(AppState::new(config));
+    let state = Arc::new(AppState::new(config)?);
     let app = webhook::router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen, "bridge-provider listening");
+    tracing::info!(%listen, bridge_instance_id = %uuid::Uuid::new_v4(),
+        state_path = %state.config.state_path.display(), "bridge-provider listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;

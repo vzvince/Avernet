@@ -212,22 +212,11 @@ impl Engine for CfuseCodex {
                     };
                     match map_codex_line(&line, &req.run_id) {
                         CodexMap::SessionId(sid) => {
-                            // Validate before adopting: an engine-supplied id is
-                            // later used as a transcript path component and an
-                            // `exec resume <sid>` argv argument, so it must be
-                            // safe. An invalid id is logged and treated as no
-                            // session (not persisted, not resumed, transcript
-                            // sink skipped).
-                            if is_valid_engine_session_id(&sid) {
-                                engine_session_id = Some(sid);
-                            } else {
-                                tracing::warn!(
-                                    target: "bridge_provider",
-                                    session_id = %sid,
-                                    "codex thread.started supplied invalid session id; \
-                                     ignoring (not persisted/resumed)"
-                                );
+                            if !is_valid_engine_session_id(&sid) {
+                                return Err(TurnError::Protocol("codex supplied invalid session id".into()));
                             }
+                            req.session_observer.established(&sid).await.map_err(TurnError::SessionStorage)?;
+                            engine_session_id = Some(sid);
                         }
                         CodexMap::Events(evs) => {
                             for ev in evs {

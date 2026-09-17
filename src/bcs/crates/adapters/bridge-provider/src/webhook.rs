@@ -3,7 +3,7 @@ use axum::{extract::State, http::HeaderMap, response::{IntoResponse, Response}, 
 use bcs_protocol::BCN_PROTOCOL_VERSION_HEADER;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::{config::{EngineKind, ProviderConfig}, engine::transcript::TranscriptSink, error::BridgeError, idempotency::IdemDecision, interaction::ResolveOutcome, run::RunRegistry};
+use crate::{config::ProviderConfig, error::BridgeError, idempotency::IdemDecision, interaction::ResolveOutcome, run::RunRegistry};
 
 #[derive(Debug, Deserialize)]
 pub struct ToBot { pub provider_id: String, pub provider_bot_ref: String }
@@ -29,7 +29,8 @@ pub struct AppState {
     pub trace: Option<Arc<crate::engine::trace::TraceStore>>,
 }
 impl AppState {
-    pub fn new(config: ProviderConfig) -> Self {
+    pub fn new(config: ProviderConfig) -> Result<Self, crate::session::SessionError> {
+        let sessions = crate::session::SessionStore::open(&config.state_path, &config.provider_id, &config.bots)?;
         let trace = config.trace_dir.as_deref().and_then(|dir| {
             match crate::engine::trace::TraceStore::open(dir) {
                 Ok(trace) => Some(trace),
@@ -44,14 +45,14 @@ impl AppState {
                 }
             }
         });
-        Self {
+        Ok(Self {
             config,
             idem: crate::idempotency::IdempotencyLedger::new(),
-            sessions: crate::session::SessionStore::new(),
+            sessions,
             runs: RunRegistry::new(),
             interactions: crate::interaction::InteractionRegistry::new(),
             trace,
-        }
+        })
     }
 }
 
@@ -241,20 +242,9 @@ async fn handle_interaction_resolve(state: Arc<AppState>, req: DownstreamRequest
 /// Handle `chat.inject`: queue an observation message into the session without
 /// driving an engine turn (spec §5.1: inject never triggers a run).
 ///
-/// Flow:
-/// 1. Validate `session_id` + `message` + bot exists.
-/// 2. Pass through the idempotency ledger (Task 5) with fingerprint
-///    `method + provider_bot_ref + session_id + message` — replay serves the
-///    prior `{"ok":true}` ACK, mismatch yields 409.
-/// 3. Sink-first-then-store (Task 13 brief choice — SessionStore has no
-///    remove-one API): for `cc` bots with an established `engine_session_id`,
-///    attempt [`ClaudeJsonlSink`]; on success the message is in the engine's
-///    own transcript and the BCS re-send will resume against it, so we do NOT
-///    add it to `pending_injects`. On sink failure (or no engine session yet, or
-///    `$HOME` unset, or codex engine) we fall back to `pending_injects`, which
-///    `run::assemble_prompt` drains FIFO and prepends to the next chat.send
-///    prompt as `[from:{name}] {text}` lines (codex path / cc-without-session).
-/// 4. Complete the idempotency ledger and ACK `{"ok":true}`.
+/// The SQLite receipt and queued message commit together before ACK. Both
+/// engines prepend queued observations on the next send; no native transcript
+/// files are read or modified, and inject never starts an engine.
 async fn handle_chat_inject(
     state: Arc<AppState>,
     req: DownstreamRequest,
@@ -277,23 +267,13 @@ async fn handle_chat_inject(
         .ok_or_else(|| BridgeError::bot_not_found(&req.to_bot.provider_bot_ref))?
         .clone();
 
-    // 4. Idempotency: fingerprint = method + provider_bot_ref + session_id + message.
-    let msg_str = serde_json::to_string(&message).unwrap_or_default();
-    let fp = crate::idempotency::fingerprint(&[
-        "chat.inject",
-        &req.to_bot.provider_bot_ref,
-        &session_id,
-        &msg_str,
-    ]);
+    // Include all sender identity and message fields in the durable receipt.
+    // Structured serialization avoids delimiter ambiguity in arbitrary text.
+    let fingerprint = serde_json::to_string(&json!([message, req.from]))
+        .map_err(|_| BridgeError::invalid_request("cannot encode inject payload"))?;
     let run_id = req.id.clone();
-    match state.idem.begin(&run_id, &fp) {
-        IdemDecision::Proceed => {}
-        IdemDecision::Replay { status, body } => return Ok((status, Json(body)).into_response()),
-        IdemDecision::Conflict => return Err(BridgeError::conflict()),
-    }
 
-    // 5. Flatten `from.name` (optional) + `message.content[].text` into the
-    //    `InjectedMessage` shape reused by both sink and pending-store paths.
+    // Flatten sender name and text for the durable queue and next-turn prompt.
     let from_name = req
         .from
         .as_ref()
@@ -302,48 +282,20 @@ async fn handle_chat_inject(
         .map(str::to_string);
     let text = crate::run::extract_message_text(Some(&message));
 
-    // 6. Sink-first-then-store.
-    let mapping = state.sessions.mapping(&bot.provider_bot_ref, &session_id).await;
-    let mut sunk = false;
-    if bot.engine == EngineKind::CfuseCc {
-        if let (Some(sink), Some(engine_session_id)) = (
-            crate::engine::transcript::ClaudeJsonlSink::default_home(),
-            mapping.engine_session_id.as_deref(),
-        ) {
-            let inj = crate::session::InjectedMessage {
-                run_id: run_id.clone(),
-                from_name: from_name.clone(),
-                text: text.clone(),
-            };
-            match sink.append_user_message(&bot.cwd, engine_session_id, &inj) {
-                Ok(()) => sunk = true,
-                Err(e) => tracing::warn!(
-                    target: "bridge_provider",
-                    error = %e,
-                    "transcript sink failed; falling back to pending injects"
-                ),
+    let injected = crate::session::InjectedMessage {
+        run_id, from_name, text,
+    };
+    state.sessions.enqueue_inject(&bot.provider_bot_ref, &session_id, injected, fingerprint)
+        .await.map_err(|error| {
+            if matches!(error, crate::session::SessionError::Conflict) {
+                BridgeError::conflict()
+            } else {
+                tracing::error!(%error, provider_bot_ref = %bot.provider_bot_ref,
+                    bcs_session_id = %session_id, "inject persistence failed");
+                BridgeError::unavailable("inject persistence failed")
             }
-        }
-    }
-    if !sunk {
-        state
-            .sessions
-            .add_inject(
-                &bot.provider_bot_ref,
-                &session_id,
-                crate::session::InjectedMessage {
-                    run_id: run_id.clone(),
-                    from_name,
-                    text,
-                },
-            )
-            .await;
-    }
-
-    // 7. Complete the ledger and ACK.
-    let resp = json!({ "ok": true });
-    state.idem.complete(&run_id, resp.clone());
-    Ok(Json(resp).into_response())
+        })?;
+    Ok(Json(json!({ "ok": true })).into_response())
 }
 
 /// Handle `chat.abort` (Task 14, spec §5.3): cancel the active run for the
