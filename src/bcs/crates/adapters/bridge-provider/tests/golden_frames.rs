@@ -141,7 +141,7 @@ fn interaction_requested_exec_roundtrips() {
         bcs_protocol::stream::InteractionKind::Exec,
         "int-1",
         json!({"title":"Run command?","command":"npm run deploy",
-               "options":[{"decision":"allow_once","label":"Allow once"},
+               "options":[{"decision":"allow-once","label":"Allow once"},
                           {"decision":"deny","label":"Deny"}]}),
     );
     let frame = event_to_frame(&ev, 7, 100, "r-1").unwrap();
@@ -151,9 +151,87 @@ fn interaction_requested_exec_roundtrips() {
         StreamEvent::Interaction(i) => {
             assert_eq!(i.interaction_id, "int-1");
             assert_eq!(i.kind, bcs_protocol::stream::InteractionKind::Exec);
-            assert_eq!(data["options"][0]["decision"], json!("allow_once"));
+            assert_eq!(data["options"][0]["decision"], json!("allow-once"));
         }
         other => panic!("expected interaction, got {other:?}"),
+    }
+}
+
+fn tool_result_frame(result: serde_json::Value, phase: ToolPhase) -> serde_json::Value {
+    let event = agent_tool("r-1", bcs_protocol::stream::ToolData {
+        phase,
+        name: Some("lookup".into()),
+        tool_call_id: Some("tc-1".into()),
+        is_error: Some(true),
+        exit_code: Some(1),
+        duration_ms: Some(120),
+        cwd: None,
+        args: Some(json!({"result":"argument"})),
+        result: Some(result),
+        partial_result: Some(json!({"result":"partial"})),
+    });
+    let frame = event_to_frame(&event, 4, 100, "r-1").unwrap();
+    split_frame(&frame).1
+}
+
+#[test]
+fn tool_result_unwraps_single_field_objects_and_json_strings_once() {
+    let cases = [
+        (json!({"result":"完成"}), json!("完成")),
+        (json!(r#"{"result":"完成"}"#), json!("完成")),
+        (json!({"result":{"items":[1,2]}}), json!({"items":[1,2]})),
+        (json!(r#"{"result":{"items":[1,2]}}"#), json!({"items":[1,2]})),
+        (json!({"result":[1,"two"]}), json!([1,"two"])),
+        (json!({"result":0}), json!(0)),
+        (json!({"result":false}), json!(false)),
+        (json!({"result":null}), json!(null)),
+        (json!({"result":""}), json!("")),
+        (json!({"result":{"result":"inner"}}), json!({"result":"inner"})),
+        (json!(r#"{"result":"{\"result\":\"inner\"}"}"#), json!(r#"{"result":"inner"}"#)),
+        (json!(" \n{\"result\":\"ok\"}\t"), json!("ok")),
+    ];
+    for (input, expected) in cases {
+        let data = tool_result_frame(input.clone(), ToolPhase::Result);
+        assert_eq!(data.get("result"), Some(&expected), "input: {input}");
+        assert_eq!(data["toolCallId"], json!("tc-1"));
+        assert_eq!(data["isError"], json!(true));
+        assert_eq!(data["exitCode"], json!(1));
+        assert_eq!(data["args"], json!({"result":"argument"}));
+        assert_eq!(data["partialResult"], json!({"result":"partial"}));
+    }
+}
+
+#[test]
+fn tool_result_preserves_nonwrappers_and_objects_with_sibling_fields() {
+    let cases = [
+        json!("ordinary output"),
+        json!(r#"{"result":"unfinished""#),
+        json!(r#"{"result":"ok"} trailing output"#),
+        json!("null"),
+        json!("42"),
+        json!("[1,2]"),
+        json!(null),
+        json!({}),
+        json!({"message":"ok"}),
+        json!(" { \"message\": \"ok\" } "),
+        json!({"result":"ok","error":null}),
+        json!(r#"{"result":"ok","metadata":{"count":1}}"#),
+        json!({"Result":"case-sensitive"}),
+        json!([{"type":"text","text":"{\"result\":\"keep\"}"}]),
+        json!({"content":[{"type":"text","text":"{\"result\":\"keep\"}"}]}),
+    ];
+    for input in cases {
+        let data = tool_result_frame(input.clone(), ToolPhase::Result);
+        assert_eq!(data.get("result"), Some(&input), "input: {input}");
+    }
+}
+
+#[test]
+fn tool_result_wrapper_handling_does_not_change_start_or_update_events() {
+    for phase in [ToolPhase::Start, ToolPhase::Update] {
+        let data = tool_result_frame(json!({"result":"keep"}), phase);
+        assert_eq!(data["result"], json!({"result":"keep"}));
+        assert_eq!(data["partialResult"], json!({"result":"partial"}));
     }
 }
 

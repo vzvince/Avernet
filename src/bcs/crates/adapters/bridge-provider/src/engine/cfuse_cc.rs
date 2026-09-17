@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cfuse --cc --output-format stream-json --verbose --input-format stream-json
-//!       --include-partial-messages
+//!       --include-partial-messages --permission-prompt-tool stdio
 //!       [--permission-mode <mode>] [--resume <engine_session_id>] [--model <model>]
 //! ```
 //!
@@ -49,7 +49,7 @@ impl CfuseCc {
 ///
 /// `SessionId` 携带 `system/init` 的引擎内 session id；
 /// `Final` 携带成功 `result` 的最终助手文本；
-/// `Failed` 携带非成功 `result` 的经净化退出原因（调用方上抛为
+/// `Failed` 携带非成功 `result` 或无效权限请求的经净化退出原因（调用方上抛为
 /// `TurnError::EngineExited`）；`Events` 是该行产出的 [`StreamEvent`]；
 /// `Ignore` 标记“JSON 合法但未识别”；`Malformed` 标记“非法 JSON”；
 /// `ControlRequest` 携带 `can_use_tool` 的 request_id/tool_name/input，由
@@ -255,10 +255,23 @@ fn map_control_request(v: &Value, _run_id: &str) -> CcMap {
     if subtype != "can_use_tool" {
         return CcMap::Ignore;
     }
-    let request_id = req.get("request_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let tool_name = req.get("tool_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let input = req.get("input").cloned().unwrap_or(Value::Null);
-    CcMap::ControlRequest { request_id, tool_name, input }
+    // Claude correlates control replies with the envelope's request_id, not
+    // a field inside request. Invalid requests must fail instead of creating
+    // an interaction that the engine can never resolve.
+    let Some(request_id) = v.get("request_id").and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty()) else {
+        return CcMap::Failed("can_use_tool requires a non-empty request_id".into());
+    };
+    let Some(tool_name) = req.get("tool_name").and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty()) else {
+        return CcMap::Failed("can_use_tool requires a non-empty tool_name".into());
+    };
+    let Some(input) = req.get("input").filter(|input| input.is_object()) else {
+        return CcMap::Failed("can_use_tool requires an input object".into());
+    };
+    CcMap::ControlRequest {
+        request_id: request_id.to_string(), tool_name: tool_name.to_string(), input: input.clone(),
+    }
 }
 
 /// Build the kind-specific `extra` payload for the `interaction/requested` SSE
@@ -270,7 +283,7 @@ fn map_control_request(v: &Value, _run_id: &str) -> CcMap {
 ///   string — a present-but-null/empty command drops the interaction and parks
 ///   the run forever, so a missing/non-string command MUST NOT emit the key;
 ///   we synthesize a human-readable `description` instead. The fixed options
-///   `[allow_once, deny]` are always present.
+///   `[allow-once, deny]` are always present.
 /// - ask_user (`AskUserQuestion`): `{questions}` from `input.questions[]` —
 ///   questionId = `header` fallback `question_N`, options `label → {label,
 ///   value=label}` (cc has no separate value; baas-fallback parity).
@@ -289,7 +302,7 @@ fn build_requested_extra(tool_name: &str, input: &Value) -> Value {
         let mut extra = json!({
             "title": tool_name,
             "options": [
-                { "decision": "allow_once", "label": "Allow once" },
+                { "decision": "allow-once", "label": "Allow once" },
                 { "decision": "deny", "label": "Deny" },
             ],
         });
@@ -400,11 +413,9 @@ fn ask_user_has_secret(input: &Value) -> bool {
 /// Map a BCS resolution value to the cc control_response `behavior`
 /// (`"allow"`/`"deny"`).
 ///
-/// Conservative mapping (final-review hardening): for exec, an explicit
-/// `decision` allows ONLY when it is one of the known allow-values
-/// (`allow_once`/`allow_session`/`allow_persistent`/`allow_always`); anything
-/// else — including `deny`, an unrecognized/garbage value, or a bare `allow`
-/// not in the allowlist — maps to `deny`. We never infer allow from an unknown
+/// For exec, only the offered `allow-once` decision maps to `allow`.
+/// Any other value, including `allow_once`, maps to `deny`; decision strings
+/// are exact wire values, not aliases. We never infer allow from an unknown
 /// decision. v1 limitation (spec §5.2): cc has no answers channel, so an
 /// ask_user resolution collapses to allow/deny — `action:"answer"` allows only
 /// when `answers` is a non-empty array; `cancel` and missing/empty answers map
@@ -412,7 +423,7 @@ fn ask_user_has_secret(input: &Value) -> bool {
 fn resolution_to_behavior(resolution: &Value) -> &'static str {
     if let Some(d) = resolution["decision"].as_str() {
         return match d {
-            "allow_once" | "allow_session" | "allow_persistent" | "allow_always" => "allow",
+            "allow-once" => "allow",
             _ => "deny",
         };
     }
@@ -425,6 +436,22 @@ fn resolution_to_behavior(resolution: &Value) -> &'static str {
         }
         _ => "deny",
     }
+}
+
+/// A successful control exchange may carry either an allow or a deny decision.
+/// Claude requires the outer subtype and a message on the deny branch;
+/// updatedInput belongs only to an allow response.
+fn permission_control_response(request_id: &str, behavior: &str, input: &Value) -> Value {
+    let permission = if behavior == "allow" {
+        json!({ "behavior": "allow", "updatedInput": input })
+    } else {
+        json!({ "behavior": "deny", "message": "Tool use was not approved." })
+    };
+    json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": request_id,
+                      "response": permission }
+    })
 }
 
 /// Drive one `can_use_tool` control request as a HITL interaction (Task 12):
@@ -464,11 +491,7 @@ async fn handle_control_request(
             request_id = %request_id, tool = %tool_name,
             "AskUserQuestion with secret-marked question refused; answering deny"
         );
-        let deny = json!({
-            "type": "control_response",
-            "response": { "request_id": request_id,
-                          "response": { "behavior": "deny", "updatedInput": null } }
-        });
+        let deny = permission_control_response(&request_id, "deny", &input);
         cli.write_line(&deny.to_string()).await.map_err(TurnError::Io)?;
         return Ok(());
     }
@@ -497,13 +520,7 @@ async fn handle_control_request(
     };
     // 5. Write the control_response with the mapped behavior.
     let behavior = resolution_to_behavior(&resolution);
-    let updated_input = if behavior == "allow" { Some(input.clone()) } else { None };
-    let response = json!({
-        "type": "control_response",
-        "response": { "request_id": request_id,
-                      "response": { "behavior": behavior,
-                                    "updatedInput": updated_input } }
-    });
+    let response = permission_control_response(&request_id, behavior, &input);
     cli.write_line(&response.to_string()).await.map_err(TurnError::Io)?;
     // 6. Emit resolved (best-effort — BCS may have disconnected post-request).
     // v1 limitation: ask_user resolutions carry no `decision` key, so the
@@ -541,6 +558,8 @@ impl Engine for CfuseCc {
             "--input-format".into(),
             "stream-json".into(),
             "--include-partial-messages".into(),
+            "--permission-prompt-tool".into(),
+            "stdio".into(),
         ];
         if let Some(mode) = &req.permission_mode {
             args.push("--permission-mode".into());
@@ -715,14 +734,36 @@ mod tests {
     fn control_request_can_use_tool_maps_to_control_request() {
         // 不再发占位 thinking（Task 9）——Task 12 接线为 ControlRequest 载体，
         // 由 run_turn 驱动 HITL 交互；绝不发 `stream:"approval"`（spec §2）。
-        let line = r#"{"type":"control_request","request":{"subtype":"can_use_tool","request_id":"req-7","tool_name":"Bash","input":{"command":"rm -rf /"}}}"#;
+        let line = r#"{"type":"control_request","request_id":"req-7","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#;
         match map_cc_line(line, "r-1") {
             CcMap::ControlRequest { request_id, tool_name, input } => {
                 assert_eq!(request_id, "req-7");
                 assert_eq!(tool_name, "Bash");
-                assert_eq!(input["command"], json!("rm -rf /"));
+                assert_eq!(input["command"], json!("ls"));
             }
             other => panic!("expected ControlRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_permission_requests_fail_instead_of_parking_an_unresolvable_interaction() {
+        let valid = json!({
+            "type": "control_request", "request_id": "req-1",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash",
+                         "input": { "command": "ls" } }
+        });
+        for invalid_id in [Value::Null, json!(""), json!(" "), json!(7)] {
+            let mut request = valid.clone();
+            request["request_id"] = invalid_id;
+            // A nested ID must never substitute for the engine's top-level ID.
+            request["request"]["request_id"] = json!("nested-id");
+            assert!(matches!(map_cc_line(&request.to_string(), "r-1"), CcMap::Failed(_)));
+        }
+        for (field, value) in [("tool_name", json!("")), ("tool_name", Value::Null),
+                               ("input", Value::Null), ("input", json!([]))] {
+            let mut request = valid.clone();
+            request["request"][field] = value;
+            assert!(matches!(map_cc_line(&request.to_string(), "r-1"), CcMap::Failed(_)));
         }
     }
 
@@ -731,7 +772,7 @@ mod tests {
         let extra = build_requested_extra("Bash", &json!({"command":"ls -la"}));
         assert_eq!(extra["title"], json!("Bash"));
         assert_eq!(extra["command"], json!("ls -la"));
-        assert_eq!(extra["options"][0]["decision"], json!("allow_once"));
+        assert_eq!(extra["options"][0]["decision"], json!("allow-once"));
         assert_eq!(extra["options"][0]["label"], json!("Allow once"));
         assert_eq!(extra["options"][1]["decision"], json!("deny"));
         assert_eq!(extra["options"][1]["label"], json!("Deny"));
@@ -856,13 +897,13 @@ mod tests {
 
     #[test]
     fn resolution_to_behavior_maps_exec_decisions_and_ask_user_actions() {
-        // exec: only explicit allow_* decisions → allow; everything else (deny,
+        // exec: only the offered allow-once decision → allow; everything else (deny,
         // unrecognized/garbage, a bare `allow` not in the allowlist) → deny.
         // Conservative: never infer allow from an unknown decision.
-        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_once"})), "allow");
-        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_session"})), "allow");
-        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_persistent"})), "allow");
-        assert_eq!(resolution_to_behavior(&json!({"decision":"allow_always"})), "allow");
+        assert_eq!(resolution_to_behavior(&json!({"decision":"allow-once"})), "allow");
+        for decision in ["allow_once", "allow_session", "allow_persistent", "allow_always", "allow-always"] {
+            assert_eq!(resolution_to_behavior(&json!({"decision":decision})), "deny");
+        }
         assert_eq!(resolution_to_behavior(&json!({"decision":"deny"})), "deny");
         assert_eq!(
             resolution_to_behavior(&json!({"decision":"yes"})),

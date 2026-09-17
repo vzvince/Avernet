@@ -115,7 +115,10 @@ pub fn chat_aborted(run_id: &str, stop_reason: &str) -> StreamEvent {
     })
 }
 
-pub fn agent_tool(run_id: &str, data: ToolData) -> StreamEvent {
+pub fn agent_tool(run_id: &str, mut data: ToolData) -> StreamEvent {
+    if data.phase == bcs_protocol::stream::ToolPhase::Result {
+        data.result = data.result.map(unwrap_result_wrapper);
+    }
     StreamEvent::Agent(AgentEvent {
         run_id: run_id.into(),
         seq: None,
@@ -124,6 +127,23 @@ pub fn agent_tool(run_id: &str, data: ToolData) -> StreamEvent {
         data: AgentData::Tool(data),
         raw: Value::Null,
     })
+}
+
+/// Remove one top-level `{ "result": ... }` wrapper from tool output. A
+/// JSON-encoded object is also accepted, but unmatched strings stay byte-for-byte
+/// intact. Sibling fields, content blocks, and the inner value are never traversed.
+fn unwrap_result_wrapper(mut value: Value) -> Value {
+    let mut decoded = value.as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let candidate = decoded.as_mut().unwrap_or(&mut value);
+    if let Some(object) = candidate.as_object_mut() {
+        if object.len() == 1 {
+            if let Some(inner) = object.remove("result") {
+                return inner;
+            }
+        }
+    }
+    value
 }
 
 pub fn agent_thinking(run_id: &str, delta: Option<String>, text: Option<String>) -> StreamEvent {

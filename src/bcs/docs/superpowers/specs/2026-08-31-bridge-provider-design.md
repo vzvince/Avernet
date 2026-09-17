@@ -112,7 +112,7 @@ Engine stdout ──→ EventMapper ──→ SseEncoder(seq/buffer) ──→ S
    子进程机制不进 trait。
 3. **EventMapper**：引擎原生事件 → `bcs_protocol::stream::StreamEvent`。
    cfuse cc：stream-json（`--input-format stream-json --output-format
-   stream-json --verbose --include-partial-messages`），assistant/text 增量 →
+   stream-json --verbose --include-partial-messages --permission-prompt-tool stdio`），assistant/text 增量 →
    `chat/delta`，tool_use/tool_result → `agent/tool`，`can_use_tool` 控制消息 →
    `interaction/requested(exec)`，AskUserQuestion → `interaction/requested(ask_user)`；
    cfuse codex：Codex app-server JSON-RPC over stdio（
@@ -120,6 +120,25 @@ Engine stdout ──→ EventMapper ──→ SseEncoder(seq/buffer) ──→ S
    `turn/completed/agent/turn_failed` → terminal；其它 app-server
    notifications 按 thread/turn 关联过滤）。精确字段映射以实现期对真实
    cfuse 输出的契约测试为准。
+
+   共用工具事件构造器对 `phase:result` 的完整输出做通用去壳：仅当输出是
+   恰好只含一个 `result` 字段的对象，或解析后满足此条件的 JSON 字符串，
+   才用该字段的值替换输出。只去一层，内层值保留原类型，不继续解析字符串
+   或递归去壳；不检查工具名称或 BCS 业务字段。带其他字段的对象、普通文本、
+   非法 JSON 和内容块数组保持原样，`args` / `partialResult` 不参与转换。
+   SSE 协议的外层 `result` 字段保留，可承载任意 JSON 值；原始引擎日志
+   仍记录转换前的内容。依赖单字段 `result` 包装的消费方应读取去壳后的值。
+
+   cc 权限控制使用消息顶层的 `request_id` 关联请求与回复；
+   `request` 内只读取 `subtype:can_use_tool`、`tool_name` 和 `input`。
+   缺少有效 ID、工具名或 input 对象时结束 run 并报告错误，避免产生无法
+   回传的待审批记录。回复必须包含 `response.subtype:"success"` 和原始
+   `response.request_id`；允许时发送 `behavior:"allow"` 与原始
+   `updatedInput`，拒绝时发送 `behavior:"deny"` 与 `message`。
+   普通拒绝、取消后的拒绝以及 secret 问题的拒绝共用此回复格式。
+   `permission_denials` 和工具失败文本是已结束调用的结果，不合成为待审批事件。
+   使用 cfuse 2.6.40 / Claude 2.1.199 实测，此权限通道可直接从 user 消息
+   开始，无需为此额外增加 `initialize` 握手。
 4. **SseEncoder**：`StreamEvent` → `event:/id:/data:` 文本帧；赋 `seq`
    （per-run 单调，自 1 起，跨 chat/agent/interaction 共享），SSE `id:` 镜像
    `seq`；帧 ≤ 8 MiB；UTF-8 安全切分（`char_indices`，禁止字节切片——
@@ -262,6 +281,11 @@ Accepted → Starting → Streaming ⇄ AwaitingInteraction → Terminal → Evi
 1. 引擎发权限/提问请求（cc：`can_use_tool` 控制消息；codex：权限请求事件）。
 2. EventMapper 铸造公开 `interactionId`，InteractionRegistry 存 oneshot +
    engine-native 关联，发 `interaction/requested`，run 挂起。
+   cfuse cc 的 exec 选项由 Bridge 生成，固定为 `allow-once` / `deny`，
+   对齐既有 BaaS→BCN 决策值。回程仅 `allow-once` 映射为引擎 `allow`，
+   其余值映射为 `deny`，不提供 `allow_once` 等别名或持久授权。
+   BCN 按 requested 中的选项精确校验 decision；旧版 Bridge 已发出的
+   `allow_once` 卡片不会随升级变更，需要重新发起任务生成新卡片。
 3. BCS 经 InteractionService 路由给 Human；之后独立 POST
    `interaction.resolve` 到本 webhook。
 4. 校验 + 幂等 → 触发 resolver → Driver 经引擎控制通道写回决议 → 引擎应用后

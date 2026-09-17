@@ -161,35 +161,71 @@ async fn concurrent_send_same_session_gets_429() {
 
 #[tokio::test]
 async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
-    // mock_cc_approval.sh：读 user 消息后吐 control_request(can_use_tool Bash)，
-    // 等待 stdin 的 control_response，按 behavior 吐 result。
-    let url = support::spawn_app_with_mock("mock_cc_approval.sh", "cfuse-cc").await;
-    let client = reqwest::Client::new();
+    permission_roundtrip("bash", "allow-once").await;
+}
+
+#[tokio::test]
+async fn mcp_permission_is_forwarded_and_allow_resumes_the_original_call() {
+    permission_roundtrip("mcp", "allow-once").await;
+}
+
+#[tokio::test]
+async fn unoffered_underscore_permission_decision_does_not_allow_the_tool() {
+    permission_roundtrip("mcp", "allow_once").await;
+}
+
+#[tokio::test]
+async fn mcp_permission_denial_reaches_the_engine() {
+    permission_roundtrip("mcp", "deny").await;
+}
+
+async fn permission_roundtrip(scenario: &str, decision: &str) {
+    // The peer requires the actual CLI flag and validates the complete reply,
+    // including the engine request ID, subtype, and allow/deny payload.
+    let url = support::spawn_app_with_mock("mock_cc_approval.py", "cfuse-cc").await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5)).build().unwrap();
     let resp = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .header("X-BCN-Protocol-Version", "2.0")
         .json(&json!({"type":"req","id":"run-1","method":"chat.send",
             "session_id":"s-1",
             "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
-            "message":{"role":"user","content":[{"type":"text","text":"执行一下"}]}}))
+            "message":{"role":"user","content":[{"type":"text","text":scenario}]}}))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let mut stream = resp.bytes_stream();
     let mut acc = String::new();
     // 读到 interaction/requested 帧为止
-    let iid = loop {
-        let chunk = stream.next().await.unwrap().unwrap();
+    let (iid, requested) = loop {
+        let chunk = stream.next().await.unwrap_or_else(|| panic!("stream ended before approval: {acc}")).unwrap();
         acc.push_str(&String::from_utf8_lossy(&chunk));
-        if acc.contains("\"phase\":\"requested\"") {
-            break support::extract_first_interaction_id(&acc);
+        let requested = acc.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["phase"] == "requested");
+        if let Some(requested) = requested {
+            let iid = support::extract_first_interaction_id(&acc);
+            break (iid, requested);
         }
     };
+    assert!(!acc.contains("\"state\":\"final\""), "engine must wait for permission");
+    assert_eq!(requested["kind"], json!("exec"));
+    assert_eq!(requested["options"][0]["decision"], json!("allow-once"));
+    assert_eq!(requested["options"][1]["decision"], json!("deny"));
+    if scenario == "mcp" {
+        assert_eq!(requested["title"], json!("mcp__coordination__bcs_assign_task"));
+        assert!(requested.get("command").is_none());
+        assert!(requested["description"].as_str().unwrap().contains("worker-1"));
+    } else {
+        assert_eq!(requested["command"], json!("printf approved"));
+    }
     // BCS 回程：interaction.resolve
     let ack = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
         .json(&json!({"type":"req","id":"resolve-1","method":"interaction.resolve",
             "session_id":"s-1",
             "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
             "params":{"bcsRunId":"run-1","runId":"run-1","interactionId":iid,
-                      "kind":"exec","idempotencyKey":"key-1","decision":"allow_once"}}))
+                      "kind":"exec","idempotencyKey":"key-1","decision":decision}}))
         .send().await.unwrap();
     assert_eq!(ack.json::<serde_json::Value>().await.unwrap()["ok"], json!(true));
     // 幂等重放同 key
@@ -198,7 +234,7 @@ async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
             "session_id":"s-1",
             "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
             "params":{"bcsRunId":"run-1","runId":"run-1","interactionId":iid,
-                      "kind":"exec","idempotencyKey":"key-1","decision":"allow_once"}}))
+                      "kind":"exec","idempotencyKey":"key-1","decision":decision}}))
         .send().await.unwrap();
     assert_eq!(dup.json::<serde_json::Value>().await.unwrap()["ok"], json!(true));
     // 未知 interactionId → 字符串形态 error
@@ -217,8 +253,34 @@ async fn interaction_roundtrip_over_sse_and_resolve_webhook() {
         acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
         if acc.contains("\"state\":\"final\"") { break; }
     }
-    assert!(acc.contains("\"phase\":\"resolved\""));
-    assert!(acc.contains("\"state\":\"final\""));
+    assert!(!acc.contains("\"state\":\"error\""), "control protocol failed: {acc}");
+    assert!(acc.contains("\"phase\":\"resolved\""), "missing resolution: {acc}");
+    assert!(acc.contains("\"state\":\"final\""), "engine did not resume: {acc}");
+    let resolved = acc.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["phase"] == "resolved").unwrap();
+    assert_eq!(resolved["decision"], json!(decision));
+    let expected_result = if decision == "allow-once" { "approved" } else { "denied" };
+    assert!(acc.contains(expected_result), "engine did not apply the decision: {acc}");
+}
+
+#[tokio::test]
+async fn secret_question_is_denied_with_a_valid_control_response() {
+    let url = support::spawn_app_with_mock("mock_cc_approval.py", "cfuse-cc").await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5)).build().unwrap();
+    let response = client.post(format!("{url}/webhook")).bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({"type":"req","id":"run-secret","method":"chat.send",
+            "session_id":"s-secret",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"secret"}]}}))
+        .send().await.unwrap();
+    let body = response.text().await.unwrap();
+    assert!(body.contains("\"state\":\"final\""), "invalid denial: {body}");
+    assert!(body.contains("denied"));
+    assert!(!body.contains("event: interaction"));
 }
 
 #[tokio::test]
@@ -372,6 +434,49 @@ cfuse_bin = "{}"
     assert!(sse.contains("\"bridge_to_bcs\""));
     assert!(sse.contains("event: chat"));
     assert!(sse.contains("event: agent"));
+}
+
+#[tokio::test]
+async fn wrapped_tool_result_is_unwrapped_in_sse_and_preserved_in_raw_trace() {
+    let trace_dir = tempfile::tempdir().unwrap();
+    let bin = format!("{}/tests/fixtures/mock_cc_wrapped_result.sh", env!("CARGO_MANIFEST_DIR"));
+    let url = support::spawn_app(&format!(r#"
+provider_id = "bridge-1"
+listen = "127.0.0.1:0"
+bcs_to_provider_token = "tok-b2p"
+trace_dir = "{}"
+[[bot]]
+provider_bot_ref = "worker-1"
+engine = "cfuse-cc"
+cwd = "/tmp"
+cfuse_bin = "{}"
+"#, trace_dir.path().display(), bin)).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5)).build().unwrap();
+    let response = client.post(format!("{url}/webhook"))
+        .bearer_auth("tok-b2p")
+        .header("X-BCN-Protocol-Version", "2.0")
+        .json(&json!({"type":"req","id":"wrapped-run","method":"chat.send",
+            "session_id":"wrapped-session",
+            "to_bot":{"provider_id":"bridge-1","provider_bot_ref":"worker-1"},
+            "message":{"role":"user","content":[{"type":"text","text":"lookup"}]}}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    let events: Vec<serde_json::Value> = body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let result = events.iter().find(|event| event["phase"] == "result").unwrap();
+    assert_eq!(result["toolCallId"], json!("toolu_wrapped"));
+    assert_eq!(result["result"], json!(r#"{"items":[1,2]}"#));
+    assert!(events.iter().any(|event| event["state"] == "final"));
+
+    let raw = std::fs::read_to_string(trace_dir.path().join("engine.raw.ndjson")).unwrap();
+    let raw_result = raw.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["json"]["type"] == "user").unwrap();
+    assert_eq!(raw_result["json"]["message"]["content"][0]["content"],
+        json!(r#"{"result":"{\"items\":[1,2]}"}"#));
 }
 
 #[tokio::test]
