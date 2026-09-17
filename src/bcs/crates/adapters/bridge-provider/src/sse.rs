@@ -66,7 +66,8 @@ pub fn chat_delta(run_id: &str, text: &str) -> StreamEvent {
 }
 
 pub fn chat_final(run_id: &str, text: String) -> StreamEvent {
-    let message = json!({"role":"assistant","content":[{"type":"text","text":text}]});
+    // message.timestamp 是 BCS MessageContent 的必填字段(缺失会整条丢弃),勿删。
+    let message = json!({"role":"assistant","content":[{"type":"text","text":text}],"timestamp": bcs_protocol::now_ms()});
     StreamEvent::Chat(ChatEvent {
         run_id: run_id.into(),
         seq: None,

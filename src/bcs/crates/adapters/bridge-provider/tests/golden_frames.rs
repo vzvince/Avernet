@@ -1,5 +1,6 @@
 use bridge_provider::sse::*;
 use bcs_protocol::stream::{parse_stream_event, ChatState, StreamEvent, ToolPhase};
+use bcs_protocol::ws::MessageContent;
 use serde_json::json;
 
 #[test]
@@ -79,6 +80,25 @@ fn chat_final_is_full_snapshot_terminal() {
             assert_eq!(data["message"]["content"][0]["text"], json!("最终答案"));
         }
         other => panic!("expected final, got {other:?}"),
+    }
+}
+
+/// 生产回归(2026-09-17):BCS 对 final 帧的 message 做
+/// from_value::<MessageContent> 强解析,timestamp 必填;缺失时整条正文
+/// 被丢弃("body omitted"),群聊历史不落库。chat_final 必须自带毫秒时间戳。
+#[test]
+fn chat_final_message_deserializes_into_bcs_message_content() {
+    let frame = event_to_frame(&chat_final("r-1", "最终答案".to_string()), 5, 200, "r-1").unwrap();
+    let (event, data) = split_frame(&frame);
+    match parse_stream_event(&event, data) {
+        StreamEvent::Chat(c) => {
+            let raw = c.message.expect("final frame carries message");
+            let parsed: MessageContent = serde_json::from_value(raw)
+                .expect("message must deserialize into BCS MessageContent (timestamp required)");
+            assert_eq!(parsed.role, "assistant");
+            assert!(parsed.timestamp > 0, "timestamp must be epoch-ms");
+        }
+        other => panic!("expected chat, got {other:?}"),
     }
 }
 
