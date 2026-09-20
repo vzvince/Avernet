@@ -4,7 +4,7 @@
 //! 调用形态（对齐 aix-relay `codefuse_direct_args`，spec §4.2）：
 //!
 //! ```text
-//! cfuse --cc --output-format stream-json --verbose --input-format stream-json
+//! cfuse --cc --skip-update --output-format stream-json --verbose --input-format stream-json
 //!       --include-partial-messages --permission-prompt-tool stdio
 //!       [--permission-mode <mode>] [--resume <engine_session_id>] [--model <model>]
 //! ```
@@ -555,6 +555,8 @@ impl Engine for CfuseCc {
     ) -> Result<TurnOutcome, TurnError> {
         let mut args: Vec<String> = vec![
             "--cc".into(),
+            // An upgrade prompt would consume the stream-json input and block the turn.
+            "--skip-update".into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
