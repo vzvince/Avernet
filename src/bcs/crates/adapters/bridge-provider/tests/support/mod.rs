@@ -19,7 +19,7 @@ pub async fn spawn_app_with_state(toml_text: &str) -> (String, Arc<AppState>) {
     // tempdir 不能 drop：泄漏到测试生命周期结束即可（测试进程退出清理）
     std::mem::forget(dir);
     let mut cfg = config;
-    cfg.listen = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+    cfg.listen = Some("127.0.0.1:0".parse::<SocketAddr>().unwrap());
     let state = Arc::new(AppState::new(cfg).unwrap());
     let app = webhook::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

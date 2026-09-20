@@ -10,6 +10,21 @@ use crate::engine::SessionObserver;
 use crate::session_db::{self, SessionDb, SessionKey};
 pub use crate::session_db::SessionError;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionIdentity {
+    pub bot_id: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for ConnectionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionIdentity")
+            .field("bot_id", &self.bot_id)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InjectedMessage {
     pub run_id: String,
@@ -72,6 +87,25 @@ impl SessionStore {
         let key = self.key(bot, s)?;
         let engine_session_id = self.access(move |conn| session_db::mapping(conn, &key)).await?;
         Ok(SessionMapping { engine_session_id })
+    }
+
+    /// Reconnect credentials are isolated by local namespace, server and Bot.
+    pub async fn load_identity(&self, server: &str, bot_ref: &str) -> Result<Option<ConnectionIdentity>, SessionError> {
+        if !self.bindings.contains_key(bot_ref) { return Err(SessionError::Bot(bot_ref.into())); }
+        let provider = self.provider.clone();
+        let server = server.to_owned();
+        let bot = bot_ref.to_owned();
+        self.access(move |conn| session_db::load_identity(conn, &provider, &server, &bot)).await
+    }
+
+    /// Returns only after SQLite commits; callers must validate the Bot identity
+    /// against both configuration and the restored identity before saving it.
+    pub async fn save_identity(&self, server: &str, bot_ref: &str, identity: ConnectionIdentity) -> Result<(), SessionError> {
+        if !self.bindings.contains_key(bot_ref) { return Err(SessionError::Bot(bot_ref.into())); }
+        let provider = self.provider.clone();
+        let server = server.to_owned();
+        let bot = bot_ref.to_owned();
+        self.access(move |conn| session_db::save_identity(conn, &provider, &server, &bot, &identity)).await
     }
 
     pub async fn set_engine_session_id(&self, bot: &str, s: &str, engine_id: &str) -> Result<(), SessionError> {

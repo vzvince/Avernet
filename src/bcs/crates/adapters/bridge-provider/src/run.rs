@@ -1,45 +1,22 @@
-//! RunRegistry + run loop: drives one downstream turn end-to-end and exposes a
-//! self-managed SSE frame stream to the webhook handler.
-//!
-//! Per spec §6.2/§6.4: the run loop selects over an engine-event channel, a 20s
-//! heartbeat, and a deadline timer; each engine event is stamped with a monotonic
-//! `seq`, encoded to a Provider 2.0 frame via [`crate::sse::event_to_frame`], then
-//! appended to the run buffer and broadcast. A BCS disconnect is detected when a
-//! broadcast send returns `Err` (no live subscribers); the engine is then aborted
-//! and the run closed (spec amendment: kill on write failure, no grace window).
-//!
-//! Frames are self-managed `String`s (already-formatted SSE frames) — the single
-//! testable path; the handler wraps them with [`axum::body::Body::from_stream`].
-//! Heartbeats push the raw [`crate::sse::HEARTBEAT`] comment frame and carry no
-//! `seq` (excluded from the monotonic sequence).
-//!
-//! Re-attach semantics: the same id with the same body, while active, replays the
-//! buffered frames then follows the broadcast; the same id already terminal
-//! replays the buffered terminal frames as a fresh one-shot stream; the same id
-//! with a different body is a 409 conflict (see [`RunRegistry::begin`]).
+//! Transport-independent engine execution and bounded typed event retention.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, Bytes};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::HeaderValue;
-use axum::response::Response;
 use bcs_protocol::now_ms;
 use bcs_protocol::stream::{ChatState, StreamEvent};
-use futures::stream::{StreamExt, Stream};
+use futures::stream::Stream;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{build_engine, TurnError, TurnOutcome, TurnRequest};
 use crate::engine::trace::TraceContext;
-use crate::sse::{self, event_to_frame, FrameError, HEARTBEAT};
-use crate::webhook::{AppState, DownstreamRequest};
+use crate::sse;
+use crate::runtime::{AppState, DownstreamRequest};
 use crate::config::BotConfig;
 
 /// Grace TTL for a terminal run's buffered frames before lazy sweep removes the
@@ -48,8 +25,7 @@ const TERMINAL_GRACE: Duration = Duration::from_secs(300);
 
 /// Forward-loop poll interval: after the driver marks a run terminal, the
 /// forwarder drains remaining broadcast messages and exits within this window.
-/// Kept tiny so end-of-run latency is negligible; robust against lost wake-ups
-/// because the drain is by `try_recv`, not by a one-shot Notify.
+/// Retained records are the source of truth even if broadcast wake-ups lag.
 const TERMINAL_POLL: Duration = Duration::from_millis(25);
 
 /// Result of attempting to push one frame into the run's buffer+broadcast.
@@ -58,10 +34,21 @@ enum PushOutcome {
     Ok,
     /// Broadcast had no subscribers: BCS disconnected → abort + close.
     Disconnect,
-    /// Run must terminate now (oversize frame caught → terminal error emitted,
-    /// or encoder rejected the event).
+    /// Retention or typed serialization failed; a terminal error was retained.
     Terminate,
 }
+
+/// An engine event with immutable correlation and replay metadata.
+#[derive(Clone, Debug)]
+pub struct RunEvent {
+    pub run_id: String,
+    pub seq: u64,
+    pub ts: u64,
+    pub event: StreamEvent,
+}
+
+const MAX_RETAINED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RETAINED_EVENTS: usize = 8192;
 
 /// One active or terminal run's shared state: abort token, broadcast sender,
 /// replay buffer, terminal flag, and the idempotency fingerprint.
@@ -82,9 +69,14 @@ enum PushOutcome {
 /// the driver task and each re-attach forwarder.
 #[derive(Clone)]
 pub struct RunHandle {
+    pub run_id: String,
     pub abort: CancellationToken,
-    pub tx: broadcast::Sender<String>,
-    pub buffer: Arc<Mutex<Vec<String>>>,
+    upstream: Arc<AtomicBool>,
+    delivery_pinned: Arc<AtomicBool>,
+    delivery_released_at: Arc<Mutex<Option<Instant>>>,
+    retained_bytes: Arc<AtomicUsize>,
+    pub tx: broadcast::Sender<RunEvent>,
+    pub buffer: Arc<Mutex<Vec<RunEvent>>>,
     pub terminal: Arc<AtomicBool>,
     abort_requested: Arc<AtomicBool>,
     /// `stopReason` to surface in the terminal `chat_aborted` SSE frame. Set by
@@ -96,6 +88,42 @@ pub struct RunHandle {
 }
 
 impl RunHandle {
+    pub fn snapshot_after(&self, seq: u64) -> Vec<RunEvent> {
+        self.buffer.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|event| event.seq > seq).cloned().collect()
+    }
+
+    /// Clone only the next retained record for a delivery cursor.
+    pub fn next_after(&self, seq: u64) -> Option<RunEvent> {
+        self.buffer.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .find(|event| event.seq > seq).cloned()
+    }
+
+    pub fn release_delivery(&self) {
+        if !self.upstream.load(Ordering::SeqCst) || !self.is_terminal() { return; }
+        let mut released_at = self.delivery_released_at.lock().unwrap_or_else(|p| p.into_inner());
+        if released_at.is_some() { return; }
+        let mut buffer = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        buffer.clear();
+        buffer.shrink_to_fit();
+        self.retained_bytes.store(0, Ordering::SeqCst);
+        // A long offline run gets a full tombstone grace period after delivery.
+        // Repeated releases must not renew that period indefinitely.
+        *released_at = Some(Instant::now());
+        self.delivery_pinned.store(false, Ordering::SeqCst);
+    }
+
+    fn cancel_if_gateway_disconnected(&self) {
+        if !self.upstream.load(Ordering::SeqCst) && self.tx.receiver_count() == 0 {
+            self.abort.cancel();
+        }
+    }
+
+    pub(crate) fn set_upstream(&self, upstream: bool) {
+        self.upstream.store(upstream, Ordering::SeqCst);
+        self.delivery_pinned.store(upstream, Ordering::SeqCst);
+    }
+
     /// Idempotency fingerprint match (same id + same body).
     pub fn matches(&self, fp: &str) -> bool {
         self.fp.as_ref() == fp
@@ -181,7 +209,12 @@ impl RunRegistry {
         // Retain terminal entries within grace; always retain active.
         inner.map.retain(|_, e| {
             match e.finished_at {
-                Some(t) => now.saturating_duration_since(t) < TERMINAL_GRACE,
+                Some(t) => {
+                    if e.handle.delivery_pinned.load(Ordering::SeqCst) { return true; }
+                    let released_at = *e.handle.delivery_released_at.lock().unwrap_or_else(|p| p.into_inner());
+                    let retained_since = released_at.map_or(t, |released| released.max(t));
+                    now.saturating_duration_since(retained_since) < TERMINAL_GRACE
+                }
                 None => true,
             }
         });
@@ -209,8 +242,13 @@ impl RunRegistry {
         if let Some(entry) = inner.map.get(run_id) {
             return (entry.handle.clone(), false);
         }
-        let (tx, _rx) = broadcast::channel::<String>(256);
+        let (tx, _rx) = broadcast::channel::<RunEvent>(256);
         let handle = RunHandle {
+            run_id: run_id.to_string(),
+            upstream: Arc::new(AtomicBool::new(false)),
+            delivery_pinned: Arc::new(AtomicBool::new(false)),
+            delivery_released_at: Arc::new(Mutex::new(None)),
+            retained_bytes: Arc::new(AtomicUsize::new(0)),
             abort: CancellationToken::new(),
             tx,
             buffer: Arc::new(Mutex::new(Vec::new())),
@@ -265,6 +303,11 @@ impl RunRegistry {
             .insert(run_id.to_string(), (bot.to_string(), session.to_string()));
     }
 
+    pub fn belongs_to(&self, run_id: &str, bot: &str, session: &str) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.run_session.get(run_id).map_or(false, |(b, s)| b == bot && s == session)
+    }
+
     /// Find a terminal run for `(bot, session)`, returning its run_id. Used by
     /// `chat.abort` to distinguish "no active run, but a terminal run was
     /// recorded for this session" (return 410 `run_terminated`) from "no record
@@ -312,11 +355,10 @@ impl RunRegistry {
     }
 }
 
-/// Idempotency fingerprint for a chat.send body: `message` + `session_id` +
-/// `to_bot.provider_bot_ref`, joined by the ledger's unit separator. `message`
-/// is serialized via `serde_json` so structurally-equal JSON compares equal
-/// regardless of key ordering; `to_string` failing degrades to an empty string
-/// (the body is deserialized upstream, so failure is not expected in practice).
+/// Fixed-size SHA-256 fingerprint of the serialized message, session ID and
+/// local Bot reference. Length-delimited inputs preserve field boundaries;
+/// sorted JSON object keys make structurally-equal messages compare equally.
+/// The serialized request text is temporary and is not retained in the run.
 pub fn body_fingerprint(req: &DownstreamRequest, session_id: &str) -> String {
     let msg = serde_json::to_string(&req.message)
         .unwrap_or_else(|_| String::new());
@@ -397,9 +439,8 @@ async fn run_driver(
             let mut seq = 0;
             let _ = push_frame(&handle, &mut seq, &run_id,
                 &sse::chat_error(&run_id, &error.to_string(), Some("session_store_error")), None);
-            handle.terminal.store(true, Ordering::SeqCst);
-            state.runs.finish(&run_id);
             state.sessions.finish_run(&bot.provider_bot_ref, &session_id, &run_id).await;
+            state.runs.finish(&run_id);
             return;
         }
     };
@@ -440,8 +481,6 @@ async fn run_driver(
 
     let mut seq: u64 = 0;
     let mut injects_completed = false;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Self-terminate ~30s ahead of the hard deadline so a terminal chat_error can
     // still flush before the client times out.
     let deadline_ms = timeout_ms.saturating_sub(30_000);
@@ -456,12 +495,6 @@ async fn run_driver(
                     &sse::chat_error(&run_id, "run deadline exceeded", Some("deadline")),
                     trace.as_ref());
                 break;
-            }
-            _ = heartbeat.tick() => {
-                // Heartbeat is a raw comment frame; no seq, no encode.
-                if !push_raw(&handle, HEARTBEAT) {
-                    break;
-                }
             }
             ev = ev_rx.recv() => {
                 match ev {
@@ -479,6 +512,14 @@ async fn run_driver(
                             &StreamEvent::Chat(c),
                             trace.as_ref(),
                         );
+                        break;
+                    }
+                    Some(StreamEvent::Interaction(interaction))
+                        if handle.upstream.load(Ordering::SeqCst)
+                            && interaction.phase == bcs_protocol::stream::InteractionPhase::Requested => {
+                        state.interactions.invalidate_run(&run_id, json!({ "decision": "deny" }));
+                        let _ = push_frame(&handle, &mut seq, &run_id,
+                            &sse::chat_error(&run_id, "interactive authorization is unsupported in upstream V2", Some("unsupported_interaction")), trace.as_ref());
                         break;
                     }
                     Some(event) => {
@@ -586,19 +627,55 @@ async fn run_driver(
             tracing::error!(%error, %run_id, bcs_session_id = %session_id, "failed to release inject batch");
         }
     }
-    handle.terminal.store(true, Ordering::SeqCst);
-    state.runs.finish(&run_id);
     state
         .sessions
         .finish_run(&bot.provider_bot_ref, &session_id, &run_id)
         .await;
+    // Publish terminal only after all driver cleanup and persistence work.
+    state.runs.finish(&run_id);
 }
 
-/// Push one engine event as a frame into buffer+broadcast. On oversize
-/// ([`FrameError::FrameTooLarge`]) emit a terminal `chat_error` instead and
-/// signal termination — never emit an oversize frame.
-///
-/// Synchronous (no `.await`) — the buffer mutex is never held across an await.
+/// Count serialized bytes without allocating another copy of a large payload.
+fn serialized_size<T: serde::Serialize>(value: &T) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+/// Account for all typed fields and raw snapshots, independent of any wire format.
+fn retained_event_size(event: &StreamEvent) -> Result<usize, serde_json::Error> {
+    use bcs_protocol::stream::AgentData;
+    let size = match event {
+        StreamEvent::Chat(c) => serialized_size(&(&c.run_id, c.seq, &c.state, &c.session_key,
+            &c.delta_text, &c.stop_reason, &c.error_message, &c.error_kind, &c.error_code, &c.message, &c.raw))?,
+        StreamEvent::Agent(a) => {
+            let metadata = serialized_size(&(&a.run_id, a.seq, a.ts, &a.session_key, &a.raw))?;
+            metadata + match &a.data {
+                AgentData::Tool(data) => serialized_size(data)?,
+                AgentData::Thinking(data) => serialized_size(data)?,
+                AgentData::Approval(data) => serialized_size(data)?,
+                AgentData::Lifecycle(data) => serialized_size(data)?,
+                AgentData::Phase(data) => serialized_size(data)?,
+                AgentData::Unknown { stream, raw } => serialized_size(&(stream, raw))?,
+            }
+        }
+        StreamEvent::Interaction(i) => serialized_size(&(&i.run_id, i.seq, i.ts, &i.session_key,
+            &i.phase, &i.interaction_id, &i.kind, &i.raw))?,
+        StreamEvent::Unknown { event, raw } => serialized_size(&(event, raw))?,
+        StreamEvent::Ping { ts } => serialized_size(ts)?,
+    };
+    Ok(size + size_of::<RunEvent>())
+}
+
+/// Retain a typed event; reserve one bounded terminal error beyond the budget.
 fn push_frame(
     handle: &RunHandle,
     seq: &mut u64,
@@ -608,182 +685,228 @@ fn push_frame(
 ) -> PushOutcome {
     *seq += 1;
     let ts = now_ms();
-    let frame = match event_to_frame(ev, *seq, ts, run_id) {
-        Ok(f) => f,
-        Err(FrameError::FrameTooLarge(_)) => {
-            // Emit a bounded terminal error instead of the oversize frame.
-            *seq += 1;
-            let err_ev = sse::chat_error(run_id, "frame too large", Some("runtime_error"));
-            let err_frame = match event_to_frame(&err_ev, *seq, now_ms(), run_id) {
-                Ok(f) => f,
-                Err(_) => return PushOutcome::Terminate,
-            };
-            let _ = push_raw(handle, &err_frame);
-            return PushOutcome::Terminate;
-        }
-        Err(_) => return PushOutcome::Terminate,
+    let size = retained_event_size(ev).map(|size| size.saturating_add(run_id.len()));
+    let mut buffer = handle.buffer.lock().unwrap_or_else(|p| p.into_inner());
+    let failure = match size {
+        Ok(size) if buffer.len() >= MAX_RETAINED_EVENTS || handle.retained_bytes.load(Ordering::SeqCst).saturating_add(size) > MAX_RETAINED_BYTES => Some(("run event retention limit exceeded", "buffer_overflow")),
+        Ok(size) => { handle.retained_bytes.fetch_add(size, Ordering::SeqCst); None }
+        Err(_) => Some(("event serialization failed", "runtime_error")),
     };
-    if let Some(trace) = trace {
-        trace.record_converted(ev, *seq);
-        trace.record_sse(*seq, &frame);
-    }
-    if push_raw(handle, &frame) {
+    let event = match failure {
+        Some((message, kind)) => sse::chat_error(run_id, message, Some(kind)),
+        None => ev.clone(),
+    };
+    if let Some(trace) = trace { trace.record_converted(&event, *seq); }
+    let record = RunEvent { run_id: run_id.to_string(), seq: *seq, ts, event };
+    buffer.push(record.clone());
+    let sent = handle.tx.send(record).is_ok();
+    if failure.is_some() {
+        handle.abort.cancel();
+        PushOutcome::Terminate
+    } else if sent || handle.upstream.load(Ordering::SeqCst) {
         PushOutcome::Ok
     } else {
         PushOutcome::Disconnect
     }
 }
 
-/// Append a pre-formatted frame string to the buffer and broadcast it. The
-/// buffer write + broadcast send happen under the buffer mutex so that a
-/// concurrent forwarder's `(subscribe, snapshot)` observes the two as one atomic
-/// operation — neither duplicated nor lost. Returns `false` if the broadcast had
-/// no live subscribers (BCS disconnect).
-fn push_raw(handle: &RunHandle, frame: &str) -> bool {
-    let send_ok = {
-        let mut buf = handle.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        buf.push(frame.to_string());
-        handle.tx.send(frame.to_string())
-    };
-    send_ok.is_ok()
-}
-
-/// Build the client-facing SSE response: spawn a forwarder that replays the
-/// buffered frames then follows the broadcast, and wrap its mpsc receiver as a
-/// `Body::from_stream`. This is the re-attach path too — the same handle is
-/// reused, so a second subscriber replays the buffer and joins the live stream.
-///
-/// `subscribe()` + buffer snapshot are taken atomically (under the buffer
-/// mutex) so the snapshot's contents exactly partition from the broadcast's
-/// post-subscribe messages — no duplicate frames, no lost frames. The forwarder
-/// then drains the broadcast until the run is terminal and the receiver is
-/// empty; a short poll wakes it after the driver marks terminal so it exits
-/// promptly (broadcast `Closed` never fires because the registry retains the
-/// `Sender` for terminal replay).
-pub fn forward_stream(handle: RunHandle) -> impl Stream<Item = String> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<String>(64);
-    // Atomic (w.r.t. pushes): snapshot the buffer and subscribe so the partition
-    // is exact — snapshot holds frames pushed up to here; broadcast carries only
-    // frames pushed after subscribe.
-    let (snapshot, subscriber) = {
-        let buf = handle.buffer.lock().unwrap_or_else(|p| p.into_inner());
-        let snap = buf.clone();
-        let sub = handle.tx.subscribe();
-        (snap, sub)
+/// Subscribe synchronously before spawning an engine. Replay also repairs a
+/// lagging broadcast receiver from the retained records without sequence gaps.
+pub fn forward_stream(handle: RunHandle) -> impl Stream<Item = RunEvent> + Send + 'static {
+    let (tx, rx) = mpsc::channel::<RunEvent>(64);
+    let mut subscriber = {
+        let _buffer = handle.buffer.lock().unwrap_or_else(|p| p.into_inner());
+        handle.tx.subscribe()
     };
     tokio::spawn(async move {
-        // Replay the buffer snapshot first.
-        for frame in snapshot {
-            if tx.send(frame).await.is_err() {
-                return;
-            }
-        }
-        // Then follow the live broadcast until terminal + drained.
-        let mut sub = subscriber;
+        let mut cursor = 0;
         loop {
+            for event in handle.snapshot_after(cursor) {
+                cursor = event.seq;
+                if tx.send(event).await.is_err() { drop(subscriber); handle.cancel_if_gateway_disconnected(); return; }
+            }
+            if handle.is_terminal() && handle.snapshot_after(cursor).is_empty() { return; }
             tokio::select! {
-                ev = sub.recv() => {
-                    match ev {
-                        Ok(frame) => {
-                            if tx.send(frame).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                target: "bridge_provider",
-                                n, "SSE broadcast lagged; BCS tolerates seq gaps"
-                            );
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-                _ = tokio::time::sleep(TERMINAL_POLL) => {
-                    // Driver marked terminal: drain any remaining buffered
-                    // broadcast messages, then stop.
-                    if handle.is_terminal() {
-                        loop {
-                            match sub.try_recv() {
-                                Ok(frame) => {
-                                    if tx.send(frame).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(broadcast::error::TryRecvError::Empty)
-                                | Err(broadcast::error::TryRecvError::Closed) => return,
-                                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                            }
-                        }
-                    }
-                }
+                _ = tx.closed() => { drop(subscriber); handle.cancel_if_gateway_disconnected(); return; },
+                event = subscriber.recv() => match event {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = tokio::time::sleep(TERMINAL_POLL) => {},
             }
         }
     });
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
-/// Wrap a frame stream as an SSE `text/event-stream` response.
-pub fn sse_response(stream: impl Stream<Item = String> + Send + 'static) -> Response {
-    let body = Body::from_stream(
-        stream.map(|s| Ok::<_, Infallible>(Bytes::from(s))),
-    );
-    let mut resp = Response::new(body);
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    resp.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    resp
-}
-
-/// Spawn the run-driver task for a freshly-created run and return the SSE
-/// response streaming its frames. The caller must have already reserved the
-/// session slot and confirmed `is_new == true` via [`RunRegistry::begin`].
+/// The caller must create its subscription before spawning the engine.
 pub fn spawn_run(
     state: Arc<AppState>,
     req: DownstreamRequest,
     bot: BotConfig,
     session_id: String,
     handle: RunHandle,
-) -> Response {
-    // Build the forward stream BEFORE spawning the driver. `forward_stream`
-    // subscribes to the broadcast synchronously inside the call; the driver's
-    // heartbeat interval first-ticks immediately, and a broadcast send with no
-    // live receiver reads as a BCS disconnect (`push_raw` returns false → the
-    // run breaks as a false-positive disconnect). Subscribing first guarantees a
-    // receiver exists before the driver can send its first heartbeat.
-    let stream = forward_stream(handle.clone());
-    let driver_handle = handle;
+) {
     tokio::spawn(async move {
-        run_driver(state, driver_handle, req, bot, session_id).await;
+        run_driver(state, handle, req, bot, session_id).await;
     });
-    sse_response(stream)
-}
-
-/// Re-attach a terminal run's buffered frames as a fresh one-shot SSE stream
-/// (no driver, no broadcast subscription — the run is already closed).
-pub fn terminal_replay_response(handle: RunHandle) -> Response {
-    let (tx, rx) = mpsc::channel::<String>(64);
-    let h = handle;
-    tokio::spawn(async move {
-        let snapshot = h
-            .buffer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        for frame in snapshot {
-            if tx.send(frame).await.is_err() {
-                return;
-            }
-        }
-    });
-    sse_response(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivered_large_request_keeps_only_fixed_size_fingerprint() {
+        let req: DownstreamRequest = serde_json::from_value(json!({
+            "id": "large-request", "method": "chat.send", "session_id": "session",
+            "to_bot": {"provider_id": "provider", "provider_bot_ref": "worker"},
+            "message": {"content": [{"type": "text", "text": "x".repeat(8 * 1024 * 1024)}]}
+        })).unwrap();
+        let fingerprint = body_fingerprint(&req, "session");
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin(&req.id, fingerprint.clone());
+        handle.set_upstream(true);
+        registry.finish(&req.id);
+        handle.release_delivery();
+        assert_eq!(handle.fp.len(), 64, "tombstones must not retain request text");
+        let (same, is_new) = registry.begin(&req.id, body_fingerprint(&req, "session"));
+        assert!(!is_new);
+        assert!(same.matches(&fingerprint));
+        let mut changed = req;
+        changed.message = Some(json!({"content": [{"type": "text", "text": "changed"}]}));
+        assert!(!same.matches(&body_fingerprint(&changed, "session")));
+    }
+
+    #[test]
+    fn delivered_upstream_keeps_tombstone_but_releases_payloads() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("delivered", "fp".into());
+        handle.set_upstream(true);
+        let mut seq = 0;
+        push_frame(&handle, &mut seq, "delivered", &sse::chat_delta("delivered", "payload"), None);
+        handle.release_delivery();
+        assert!(handle.delivery_pinned.load(Ordering::SeqCst), "active delivery cannot be released");
+        assert_eq!(handle.snapshot_after(0).len(), 1);
+        registry.finish("delivered");
+        handle.release_delivery();
+        assert!(handle.snapshot_after(0).is_empty());
+        assert_eq!(handle.retained_bytes.load(Ordering::SeqCst), 0);
+        let (repeated, is_new) = registry.begin("delivered", "fp".into());
+        assert!(!is_new, "a duplicate must not launch a new engine");
+        assert!(repeated.is_terminal());
+        assert!(repeated.matches("fp"));
+    }
+
+    #[tokio::test]
+    async fn dropping_idle_gateway_subscription_cancels_promptly() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("idle", "fp".into());
+        drop(forward_stream(handle.clone()));
+        tokio::time::timeout(Duration::from_millis(200), handle.abort.cancelled()).await.unwrap();
+    }
+
+    #[test]
+    fn runtime_retains_events_without_gateway_wire_support() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("opaque", "fp".into());
+        handle.set_upstream(true);
+        let mut seq = 0;
+        let event = StreamEvent::Unknown { event: "opaque".into(), raw: json!({"x": 7}) };
+        assert!(matches!(push_frame(&handle, &mut seq, "opaque", &event, None), PushOutcome::Ok));
+        assert!(matches!(handle.next_after(0).unwrap().event, StreamEvent::Unknown { .. }));
+    }
+
+    #[test]
+    fn retention_budget_counts_raw_event_payloads() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("raw-budget", "fp".into());
+        handle.set_upstream(true);
+        let mut seq = 0;
+        let mut event = sse::chat_delta("raw-budget", "small wire delta");
+        if let StreamEvent::Chat(chat) = &mut event { chat.raw = json!({"trace": "x".repeat(7 * 1024 * 1024)}); }
+        for _ in 0..4 {
+            assert!(matches!(push_frame(&handle, &mut seq, "raw-budget", &event, None), PushOutcome::Ok));
+        }
+        assert!(matches!(push_frame(&handle, &mut seq, "raw-budget", &event, None), PushOutcome::Terminate));
+        assert!(matches!(&handle.snapshot_after(4)[0].event, StreamEvent::Chat(chat) if chat.error_kind.as_deref() == Some("buffer_overflow")));
+    }
+
+    #[test]
+    fn upstream_without_receivers_retains_until_delivery_released() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("offline", "fp".into());
+        handle.set_upstream(true);
+        let mut seq = 0;
+        assert!(matches!(push_frame(&handle, &mut seq, "offline", &sse::chat_final("offline", "done".into()), None), PushOutcome::Ok));
+        registry.finish("offline");
+        registry.inner.lock().unwrap().map.get_mut("offline").unwrap().finished_at = Some(Instant::now() - TERMINAL_GRACE - Duration::from_secs(1));
+        assert!(registry.get("offline").is_some());
+        assert_eq!(handle.snapshot_after(0).len(), 1);
+        handle.release_delivery();
+        assert!(registry.get("offline").is_some(), "delivery starts a fresh tombstone grace period");
+        let (_, is_new) = registry.begin("offline", "fp".into());
+        assert!(!is_new, "late offline delivery must not permit re-execution");
+        let expired = Instant::now() - TERMINAL_GRACE - Duration::from_secs(1);
+        *handle.delivery_released_at.lock().unwrap() = Some(expired);
+        handle.release_delivery();
+        assert_eq!(*handle.delivery_released_at.lock().unwrap(), Some(expired), "release is idempotent");
+        assert!(registry.get("offline").is_none(), "delivered tombstone expires after its delivery grace");
+    }
+
+    #[test]
+    fn retention_count_overflow_keeps_terminal_error_and_cancels() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("overflow", "fp".into());
+        handle.set_upstream(true);
+        let mut seq = 0;
+        for _ in 0..MAX_RETAINED_EVENTS {
+            assert!(matches!(push_frame(&handle, &mut seq, "overflow", &sse::chat_delta("overflow", "x"), None), PushOutcome::Ok));
+        }
+        assert!(matches!(push_frame(&handle, &mut seq, "overflow", &sse::chat_delta("overflow", "x"), None), PushOutcome::Terminate));
+        assert!(handle.abort.is_cancelled());
+        let events = handle.snapshot_after(MAX_RETAINED_EVENTS as u64);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, StreamEvent::Chat(chat) if chat.state == ChatState::Error && chat.error_kind.as_deref() == Some("buffer_overflow")));
+    }
+
+    #[tokio::test]
+    async fn forwarder_repairs_broadcast_lag_without_gaps() {
+        use futures::StreamExt;
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("lag", "fp".into());
+        let mut stream = Box::pin(forward_stream(handle.clone()));
+        let mut seq = 0;
+        for _ in 0..600 {
+            assert!(matches!(push_frame(&handle, &mut seq, "lag", &sse::chat_delta("lag", "x"), None), PushOutcome::Ok));
+        }
+        registry.finish("lag");
+        for expected in 1..=600 {
+            assert_eq!(stream.next().await.unwrap().seq, expected);
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn structured_retention_preserves_metadata() {
+        let registry = RunRegistry::new();
+        let (handle, _) = registry.begin("typed-run", "fp".into());
+        let _receiver = handle.tx.subscribe();
+        let mut seq = 0;
+        push_frame(&handle, &mut seq, "typed-run", &sse::chat_final("typed-run", "done".into()), None);
+        let events = handle.snapshot_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].run_id, "typed-run");
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[0].ts, handle.snapshot_after(0)[0].ts);
+        assert!(handle.snapshot_after(1).is_empty());
+        push_frame(&handle, &mut seq, "typed-run", &sse::chat_final("typed-run", "second".into()), None);
+        let first = handle.next_after(0).unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.ts, events[0].ts);
+        assert_eq!(handle.next_after(1).unwrap().seq, 2);
+        assert!(handle.next_after(2).is_none());
+    }
 
     #[test]
     fn begin_new_then_existing_returns_same_handle() {

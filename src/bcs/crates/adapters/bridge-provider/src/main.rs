@@ -2,7 +2,7 @@
 //!
 //! Loads config from `BRIDGE_CONFIG` (default `bridge.toml`), initializes tracing
 //! with an [`EnvFilter`] from `RUST_LOG` (falls back to the `info` level when the
-//! variable is unset), and serves the webhook router on `config.listen` via axum.
+//! variable is unset), then selects the gateway HTTP or upstream Bot WS adapter.
 //!
 //! # Graceful shutdown
 //!
@@ -46,7 +46,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use bridge_provider::{config::ProviderConfig, webhook, AppState};
+use bridge_provider::{config::{ConnectionMode, ProviderConfig}, upstream, webhook, AppState};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,22 +62,28 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("bridge.toml"));
     let config = ProviderConfig::load(&config_path)?;
-    let listen = config.listen;
+    let mode = config.mode;
     let state = Arc::new(AppState::new(config)?);
-    let app = webhook::router(state.clone());
-
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(%listen, bridge_instance_id = %uuid::Uuid::new_v4(),
-        state_path = %state.config.state_path.display(), "bridge-provider listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            // axum stops taking new connections; cancel every in-flight run so
-            // the run loops finalize (aborted terminal) and their engine
-            // subprocesses are reaped before the process exits.
-            state.runs.abort_all("shutdown").await;
-        })
-        .await?;
+    match mode {
+        ConnectionMode::Gateway => {
+            let listen = state.config.listen.ok_or_else(|| anyhow::anyhow!("gateway listen required"))?;
+            let app = webhook::router(state.clone());
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            tracing::info!(%listen, state_path = %state.config.state_path.display(), "bridge-provider gateway listening");
+            axum::serve(listener, app).with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                state.runs.abort_all("shutdown").await;
+            }).await?;
+        }
+        ConnectionMode::Upstream => {
+            let shutdown = CancellationToken::new();
+            let signal = shutdown.clone();
+            let signal_task = tokio::spawn(async move { shutdown_signal().await; signal.cancel(); });
+            let result = upstream::serve(state, shutdown).await;
+            signal_task.abort();
+            result?;
+        }
+    }
     Ok(())
 }
 

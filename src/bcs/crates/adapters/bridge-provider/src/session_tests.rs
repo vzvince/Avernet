@@ -27,6 +27,7 @@ impl Fixture {
         let path = dir.path().join("bridge-state.sqlite3");
         let bots = ["worker-a", "worker-b"].into_iter().map(|name| BotConfig {
             provider_bot_ref: name.into(), engine: EngineKind::CfuseCc,
+            bot_id: None, token: None,
             model: None, cwd: dir.path().to_owned(), permission_mode: None, cfuse_bin: None,
         }).collect();
         Self { dir, path, bots }
@@ -50,6 +51,129 @@ async fn query_only(store: &SessionStore, enabled: bool) {
         conn.pragma_update(None, "query_only", enabled)?;
         Ok(())
     }).await.unwrap();
+}
+
+fn create_v1_database(fixture: &Fixture) {
+    let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+    conn.execute_batch("
+        CREATE TABLE sessions (
+            provider TEXT NOT NULL, bot TEXT NOT NULL, session TEXT NOT NULL,
+            engine TEXT NOT NULL, cwd TEXT NOT NULL, engine_session_id TEXT,
+            PRIMARY KEY (provider, bot, session)
+        );
+        CREATE TABLE injects (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL, id TEXT NOT NULL,
+            bot TEXT NOT NULL, session TEXT NOT NULL,
+            fingerprint TEXT NOT NULL, from_name TEXT, text TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','inflight','delivered')),
+            run_id TEXT,
+            UNIQUE (provider, id),
+            FOREIGN KEY (provider, bot, session) REFERENCES sessions(provider, bot, session)
+        );
+        CREATE INDEX injects_pending ON injects(provider, bot, session, state, seq);
+        PRAGMA user_version = 1;
+    ").unwrap();
+    let cwd = std::fs::canonicalize(fixture.dir.path()).unwrap();
+    conn.execute("INSERT INTO sessions VALUES ('provider-a', 'worker-a', 's-1', 'cfuse-cc', ?1, 'engine-original')",
+        [cwd.to_str().unwrap()]).unwrap();
+    conn.execute("INSERT INTO injects(provider,id,bot,session,fingerprint,from_name,text,state,run_id)
+        VALUES ('provider-a','inject-original','worker-a','s-1','original-payload','张三','preserve me','inflight','interrupted')", []).unwrap();
+}
+
+#[tokio::test]
+async fn v1_migration_preserves_session_mapping_and_recovers_inflight_injects() {
+    let fixture = Fixture::new();
+    create_v1_database(&fixture);
+    let store = fixture.open("provider-a");
+    let version = store.access(|conn| Ok(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?)).await.unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(store.mapping("worker-a", "s-1").await.unwrap().engine_session_id.as_deref(), Some("engine-original"));
+    let batch = store.claim_injects("worker-a", "s-1", "after-migration").await.unwrap();
+    assert_eq!(ids(&batch), ["inject-original"]);
+    assert_eq!(batch[0].text, "preserve me");
+    assert_eq!(batch[0].from_name.as_deref(), Some("张三"));
+    store.complete_injects("worker-a", "s-1", "after-migration").await.unwrap();
+    let identity = ConnectionIdentity { bot_id: "bot-a".into(), token: "migrated-credential".into() };
+    store.save_identity("server-a", "worker-a", identity.clone()).await.unwrap();
+    drop(store);
+    let reopened = fixture.open("provider-a");
+    assert_eq!(reopened.load_identity("server-a", "worker-a").await.unwrap(), Some(identity));
+    reopened.enqueue_inject("worker-a", "s-1", message("inject-original", "preserve me"), "original-payload".into()).await.unwrap();
+    assert!(reopened.claim_injects("worker-a", "s-1", "replay").await.unwrap().is_empty());
+}
+
+#[test]
+fn failed_v1_migration_rolls_back_schema_and_existing_rows() {
+    let fixture = Fixture::new();
+    create_v1_database(&fixture);
+    let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_recovery BEFORE UPDATE ON injects BEGIN SELECT RAISE(ABORT, 'recovery failed'); END;").unwrap();
+    drop(conn);
+    assert!(matches!(SessionStore::open(&fixture.path, "provider-a", &fixture.bots), Err(SessionError::Database(_))));
+    let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+    assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 1);
+    let state: String = conn.query_row("SELECT state FROM injects WHERE id='inject-original'", [], |row| row.get(0)).unwrap();
+    assert_eq!(state, "inflight");
+    let identities: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='connection_identities'", [], |row| row.get(0)).unwrap();
+    assert_eq!(identities, 0);
+}
+
+#[tokio::test]
+async fn connection_identity_survives_restart_and_is_scoped_to_namespace_server_and_local_bot() {
+    let fixture = Fixture::new();
+    let store = fixture.open("provider-a");
+    let identity = ConnectionIdentity { bot_id: "bot-a".into(), token: "first-credential".into() };
+    assert_eq!(store.load_identity("ws://127.0.0.1:21000/ws/bot", "worker-a").await.unwrap(), None);
+    store.save_identity("ws://127.0.0.1:21000/ws/bot", "worker-a", identity.clone()).await.unwrap();
+    drop(store);
+    let reopened = fixture.open("provider-a");
+    assert_eq!(reopened.load_identity("ws://127.0.0.1:21000/ws/bot", "worker-a").await.unwrap(), Some(identity));
+    assert_eq!(reopened.load_identity("ws://127.0.0.1:21001/ws/bot", "worker-a").await.unwrap(), None);
+    assert_eq!(reopened.load_identity("ws://127.0.0.1:21000/ws/bot", "worker-b").await.unwrap(), None);
+    let refreshed = ConnectionIdentity { bot_id: "bot-a".into(), token: "refreshed-credential".into() };
+    reopened.save_identity("ws://127.0.0.1:21000/ws/bot", "worker-a", refreshed.clone()).await.unwrap();
+    drop(reopened);
+    let other_namespace = fixture.open("provider-b");
+    assert_eq!(other_namespace.load_identity("ws://127.0.0.1:21000/ws/bot", "worker-a").await.unwrap(), None);
+    drop(other_namespace);
+    let reopened = fixture.open("provider-a");
+    assert_eq!(reopened.load_identity("ws://127.0.0.1:21000/ws/bot", "worker-a").await.unwrap(), Some(refreshed));
+}
+
+#[tokio::test]
+async fn failed_identity_writes_return_errors_and_preserve_saved_credentials() {
+    let fixture = Fixture::new();
+    let store = fixture.open("provider-a");
+    let saved = ConnectionIdentity { bot_id: "bot-a".into(), token: "saved-credential".into() };
+    store.save_identity("server-a", "worker-a", saved.clone()).await.unwrap();
+    query_only(&store, true).await;
+    let rejected = ConnectionIdentity { bot_id: "bot-a".into(), token: "not-committed".into() };
+    assert!(matches!(store.save_identity("server-a", "worker-a", rejected.clone()).await, Err(SessionError::Database(_))));
+    assert!(matches!(store.save_identity("server-b", "worker-a", rejected).await, Err(SessionError::Database(_))));
+    assert_eq!(store.load_identity("server-a", "worker-a").await.unwrap(), Some(saved.clone()));
+    assert_eq!(store.load_identity("server-b", "worker-a").await.unwrap(), None);
+    drop(store);
+    let reopened = fixture.open("provider-a");
+    assert_eq!(reopened.load_identity("server-a", "worker-a").await.unwrap(), Some(saved));
+    assert_eq!(reopened.load_identity("server-b", "worker-a").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn connection_identity_rejects_unknown_local_bot() {
+    let fixture = Fixture::new();
+    let store = fixture.open("provider-a");
+    assert!(matches!(store.load_identity("server-a", "unknown").await, Err(SessionError::Bot(_))));
+    let identity = ConnectionIdentity { bot_id: "bot-a".into(), token: "test-credential".into() };
+    assert!(matches!(store.save_identity("server-a", "unknown", identity).await, Err(SessionError::Bot(_))));
+}
+
+#[test]
+fn connection_identity_debug_redacts_token() {
+    let identity = ConnectionIdentity { bot_id: "bot-a".into(), token: "private-credential".into() };
+    let diagnostic = format!("{identity:?}");
+    assert!(diagnostic.contains("bot-a"));
+    assert!(!diagnostic.contains("private-credential"));
 }
 
 #[tokio::test]
@@ -255,6 +379,50 @@ fn database_allows_only_one_owner_until_the_last_store_clone_is_dropped() {
     drop(clone);
     let reopened = fixture.open("provider-a");
     drop(reopened);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(unsafe_code)]
+fn database_owner_drop_releases_lock_while_an_unrelated_child_has_not_execed() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{net::UnixStream, process::CommandExt};
+
+    let fixture = Fixture::new();
+    let store = fixture.open("provider-a");
+    let (mut ready, child_ready) = UnixStream::pair().unwrap();
+    let (mut release, child_release) = UnixStream::pair().unwrap();
+    ready.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let child = std::thread::spawn(move || {
+        let ready_fd = child_ready.as_raw_fd();
+        let release_fd = child_release.as_raw_fd();
+        let mut command = std::process::Command::new("/bin/true");
+        // Pause between fork and exec, while CLOEXEC descriptors from every
+        // parent thread (including the database owner) are still inherited.
+        // SAFETY: only async-signal-safe read/write syscalls run before exec;
+        // both stream descriptors remain owned by this spawning thread.
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = 1_u8;
+                if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap().wait().unwrap()
+    });
+    ready.read_exact(&mut [0]).unwrap();
+    drop(store);
+    let reopened = SessionStore::open(&fixture.path, "provider-a", &fixture.bots);
+    // Always let the child finish before asserting, including the failing case.
+    release.write_all(&[1]).unwrap();
+    assert!(child.join().unwrap().success());
+    assert!(reopened.is_ok(), "an inherited descriptor retained the owner's lock: {:?}", reopened.err());
 }
 
 #[test]

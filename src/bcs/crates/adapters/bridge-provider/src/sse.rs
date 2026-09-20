@@ -9,7 +9,7 @@ pub const HEARTBEAT: &str = ": heartbeat\n\n";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("SSE frame too large: {0} bytes")]
+    #[error("wire frame too large: {0} bytes")]
     FrameTooLarge(usize),
     #[error("serialize SSE data: {0}")]
     Json(#[from] serde_json::Error),
@@ -197,6 +197,13 @@ pub fn interaction_event(
 // derive Serialize，故 encoder 手工构造 Value（"复用协议类型做语义、
 // encoder 独占线格式" 的边界）。调用方保证 seq 单调；ts 由 run loop 注入。
 pub fn event_to_frame(ev: &StreamEvent, seq: u64, ts: u64, run_id: &str) -> Result<String, FrameError> {
+    let (event, data) = event_to_data(ev, seq, ts, run_id)?;
+    let data_json = serde_json::to_string(&data)?;
+    encode_frame(event, Some(seq), &data_json)
+}
+
+/// Structured gateway payload, shared without serializing or parsing SSE.
+fn event_to_data(ev: &StreamEvent, seq: u64, ts: u64, run_id: &str) -> Result<(&'static str, Value), FrameError> {
     let (event, data): (&str, Value) = match ev {
         StreamEvent::Chat(c) => {
             let mut d = json!({ "runId": run_id, "seq": seq, "ts": ts });
@@ -286,8 +293,7 @@ pub fn event_to_frame(ev: &StreamEvent, seq: u64, ts: u64, run_id: &str) -> Resu
             return Err(FrameError::Unsupported);
         }
     };
-    let data_json = serde_json::to_string(&data)?;
-    encode_frame(event, Some(seq), &data_json)
+    Ok((event, data))
 }
 
 fn merge(obj: &mut serde_json::Map<String, Value>, v: Value) {

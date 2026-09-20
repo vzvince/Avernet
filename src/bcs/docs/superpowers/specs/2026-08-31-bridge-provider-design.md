@@ -387,3 +387,14 @@ inject 不加入已经认领的批次，留给下一轮；已 delivered 的回�
   SDK interrupt/zombie reap）。仅参考，不产生依赖。
 - `src/baas/docs/2026-08-19-baas-bcn-interaction-sse-design.md` — 引擎事件 →
   BCN interaction 的白名单转换与容错参考
+
+
+## Upstream V2 extension (2026-09-18)
+
+Gateway remains the default mode and retains this HTTP/SSE wire contract. Shared
+runtime buffers now contain structured events; GatewayEncoder formats SSE at
+delivery time. The new optional upstream mode uses outgoing Bot WebSocket V2
+connections and its own encoder. See [upstream V2 design and configuration](2026-09-18-bridge-upstream-v2-design.md) for disconnect handling, durable reconnect
+credentials and V2 authorization limits. Local SQLite schema v2 preserves prior
+session mappings and inject receipts but requires a backup or separate state path
+when rolling back to the v1 binary.

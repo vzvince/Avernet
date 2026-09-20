@@ -154,6 +154,8 @@ mod tests {
     async fn build_engine_wires_cfuse_codex_driver() {
         // 不 spawn：只确认 build_engine 对 CfuseCodex 返回真实驱动（而非 stub）。
         let bot = BotConfig {
+            bot_id: None,
+            token: None,
             provider_bot_ref: "codex-worker".into(),
             engine: EngineKind::CfuseCodex,
             model: None,
@@ -169,6 +171,8 @@ mod tests {
     async fn build_engine_wires_cfuse_cc_driver() {
         // 不 spawn：只确认 build_engine 对 CfuseCc 返回真实驱动（而非 stub）。
         let bot = BotConfig {
+            bot_id: None,
+            token: None,
             provider_bot_ref: "cc-worker".into(),
             engine: EngineKind::CfuseCc,
             model: None,

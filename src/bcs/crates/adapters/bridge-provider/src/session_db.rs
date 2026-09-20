@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::session::InjectedMessage;
+use crate::session::{ConnectionIdentity, InjectedMessage};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -46,8 +46,21 @@ pub(crate) struct SessionKey {
 pub(crate) struct SessionDb {
     pub connection: Mutex<Connection>,
     // Protect startup recovery and process-local run ownership across processes.
-    // The file remains on disk; the OS releases its lock when the process dies.
-    _owner: File,
+    // Fields drop in declaration order: close SQLite before releasing ownership.
+    _owner: OwnerLock,
+}
+
+struct OwnerLock(File);
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // An unrelated concurrently spawned child can inherit this descriptor
+        // until exec, even with CLOEXEC. Closing only our copy would leave the
+        // shared open description locked until that child closes its copy.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to explicitly release session database owner lock");
+        }
+    }
 }
 
 impl SessionDb {
@@ -72,13 +85,14 @@ impl SessionDb {
         lock_path.push(".lock");
         let owner = options.open(lock_path)?;
         owner.try_lock().map_err(|e| SessionError::Locked(e.to_string()))?;
+        let owner = OwnerLock(owner);
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != 0 && version != 1 {
+        if !matches!(version, 0 | 1 | 2) {
             return Err(SessionError::Schema(version));
         }
         let tx = connection.transaction()?;
@@ -100,7 +114,16 @@ impl SessionDb {
                     FOREIGN KEY (provider, bot, session) REFERENCES sessions(provider, bot, session)
                 );
                 CREATE INDEX injects_pending ON injects(provider, bot, session, state, seq);
-                PRAGMA user_version = 1;
+            ")?;
+        }
+        if version < 2 {
+            tx.execute_batch("
+                CREATE TABLE connection_identities (
+                    provider TEXT NOT NULL, server TEXT NOT NULL, bot TEXT NOT NULL,
+                    bot_id TEXT NOT NULL, token TEXT NOT NULL,
+                    PRIMARY KEY (provider, server, bot)
+                );
+                PRAGMA user_version = 2;
             ")?;
         }
         // No other Bridge owns this database. Interrupted attempts are retried
@@ -109,6 +132,25 @@ impl SessionDb {
         tx.commit()?;
         Ok(Self { connection: Mutex::new(connection), _owner: owner })
     }
+}
+
+pub(crate) fn load_identity(conn: &Connection, provider: &str, server: &str, bot: &str) -> Result<Option<ConnectionIdentity>, SessionError> {
+    Ok(conn.query_row(
+        "SELECT bot_id, token FROM connection_identities WHERE provider=?1 AND server=?2 AND bot=?3",
+        params![provider, server, bot],
+        |row| Ok(ConnectionIdentity { bot_id: row.get(0)?, token: row.get(1)? }),
+    ).optional()?)
+}
+
+pub(crate) fn save_identity(conn: &mut Connection, provider: &str, server: &str, bot: &str, identity: &ConnectionIdentity) -> Result<(), SessionError> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO connection_identities(provider,server,bot,bot_id,token) VALUES (?1,?2,?3,?4,?5)
+         ON CONFLICT(provider,server,bot) DO UPDATE SET bot_id=excluded.bot_id, token=excluded.token",
+        params![provider, server, bot, identity.bot_id, identity.token],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn ensure_session(tx: &Transaction<'_>, key: &SessionKey) -> Result<Option<String>, SessionError> {
