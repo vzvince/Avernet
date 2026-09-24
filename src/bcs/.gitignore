@@ -39,3 +39,9 @@ CLAUDE.local.md
 # Local smoke-test scratch (not source)
 PR2_SMOKE_TEST_RESULTS.txt
 SMOKE_TEST_RUNTIME.md
+
+# Local Bridge session data and SQLite sidecars.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.lock
